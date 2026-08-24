@@ -71,6 +71,8 @@ class EnvClassSingleton:
     FLASHINFER_USE_TENSOR_CORES = EnvOption()
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
     MTP_DEBUG = EnvBool(False)
+    MTP_PROFILE = EnvBool(False)
+    DISABLE_CUDA_GRAPH = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
     # GatedDeltaNet recurrent (SSM) state dtype: float32 (default) | bfloat16 | float16.
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state

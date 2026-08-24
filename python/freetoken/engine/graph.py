@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
+from freetoken.env import ENV
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.utils import init_logger, mem_GB
@@ -187,6 +188,8 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
+        if ENV.DISABLE_CUDA_GRAPH:  # profiling knob: force eager
+            return False
         return batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:

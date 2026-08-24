@@ -3,7 +3,10 @@ from __future__ import annotations
 import gc
 import math
 import os
+import time
 from datetime import timedelta
+
+from freetoken.env import ENV
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
@@ -938,6 +941,11 @@ class Engine:
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         mtp_out: MtpStepOutput | None = None
+        profile = ENV.MTP_PROFILE and batch.is_verify
+        if profile:
+            ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+            wall0 = time.perf_counter()
+            ev[0].record(self.stream)
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
@@ -948,11 +956,18 @@ class Engine:
                 # ALL logits kept (no last-token slice on non-prefill). Greedy-only.
                 # Counter updates (accept/reject) happen host-side at the drain; no
                 # complete_one here.
+                if profile:
+                    ev[1].record(self.stream)
                 sampled = logits.argmax(dim=-1).to(torch.int32)
                 b0, b1 = sampled[0::2], sampled[1::2]
                 candidates = batch.input_ids[1::2].to(torch.int32)
                 accept = b0 == candidates
+                if profile:
+                    ev[2].record(self.stream)
                 draft = self._mtp_draft(batch, b1)
+                if profile:
+                    ev[3].record(self.stream)
+                    self._profile_verify(ev, wall0)
                 verify_cpu = torch.stack([b0, b1, accept.to(torch.int32)], dim=1).to(
                     "cpu", non_blocking=True
                 )
@@ -1012,6 +1027,27 @@ class Engine:
         mtp_hidden = self.mtp_head.forward(embeds, hidden)
         draft_logits = model.lm_head.project(mtp_hidden[last_idx])
         return draft_logits.argmax(dim=-1).to(torch.int32)
+
+    def _profile_verify(self, ev, wall0: float) -> None:
+        """FREETOKEN_MTP_PROFILE=1: rolling GPU-time breakdown of the verify step
+        (target forward / sample+accept / MTP draft) + host wall time. Synchronizes
+        once per logging window; profiling runs only."""
+        acc = getattr(self, "_prof_acc", None)
+        if acc is None:
+            acc = self._prof_acc = {"n": 0, "target": 0.0, "sample": 0.0, "draft": 0.0, "wall": 0.0}
+        ev[3].synchronize()
+        acc["target"] += ev[0].elapsed_time(ev[1])
+        acc["sample"] += ev[1].elapsed_time(ev[2])
+        acc["draft"] += ev[2].elapsed_time(ev[3])
+        acc["wall"] += (time.perf_counter() - wall0) * 1000.0
+        acc["n"] += 1
+        if acc["n"] % 100 == 0:
+            n = acc["n"]
+            logger.info(
+                f"MTP profile ({n} steps): target={acc['target']/n:.2f}ms "
+                f"sample={acc['sample']/n:.2f}ms draft={acc['draft']/n:.2f}ms "
+                f"host_wall={acc['wall']/n:.2f}ms"
+            )
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
