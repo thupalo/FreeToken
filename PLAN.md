@@ -134,7 +134,19 @@ Findings:
 - **Tests**: `tests/kernels` + `tests/moe` in-container: 303 passed, 4 skipped, 0 failed — no Triton sm_121a ptxas issues in FreeToken's kernel set.
 - **Ops gotchas** (documented in docker/README.md): GB10 `cudaMemGetInfo` ignores reclaimable page cache → "cache budget too small" after big downloads (fix: drop_caches); bench-bw profile persisted via `XDG_CACHE_HOME` in the volume; page size is 4 K (FTW O_DIRECT assumption holds); PyPI's `triton-kernels` package is NOT OpenAI's `triton_kernels` (name collision — install from the triton repo subdirectory if ever needed).
 
-Remaining Phase 2: llama.cpp (MXFP4_MOE GGUF) head-to-head. Phase 3 candidates unchanged, plus: report the b12x int32 overflow upstream to flashinfer.
+llama.cpp head-to-head (same box, same prompts; llama.cpp on MXFP4_MOE GGUF, full GPU offload): FreeToken 63.5 vs llama.cpp 59.4 tok/s decode (+7%), but llama.cpp wins prefill 2357 vs 1062 tok/s (2.2×) and short-prompt TTFT 0.073 vs 0.35 s. The paper's 1.8–2.3× decode advantage on PCIe rigs collapses on unified memory, as predicted; FreeToken's differentiators here are agentic semantic caching, elastic memory, and the dual API surface. Prefill is the optimization target.
+
+### Speculative decoding assessment (2026-08-24)
+
+Feasible and the highest-leverage Phase 3 item: decode is bandwidth-bound, and verifying k drafted tokens costs roughly the same weight traffic as generating one, so accept-length multiplies tok/s almost directly.
+
+- **Method choice: native MTP first.** The NVFP4 checkpoint already ships a 1-layer MTP head (`mtp_num_hidden_layers=1`) that FreeToken currently *drops at load* (`python/freetoken/models/qwen3_5_moe/weight.py:37-38,136,608`). Published benchmarks show native MTP beating EAGLE-3 and DFlash heads for this exact model (accept ~1.85–1.9 at 1 draft token, 85–93% acceptance); vLLM's DGX Spark recipe uses MTP with `num_speculative_tokens: 3`. Reference points: vLLM+NVFP4+MTP on Spark = 55.9 tok/s single-user (FreeToken already does 63.5 *without* spec decode); llama.cpp+MTP on Spark (27B dense) ≈ 2.2× single-stream.
+- **DSpark** (DeepSeek, arXiv 2607.05147, semi-autoregressive block drafter with confidence-scheduled verification; in SGLang/vLLM/llama.cpp; a trained drafter for this exact model exists: RedHatAI/Qwen3.6-35B-A3B-speculator.dspark) is the only method with a credible shot at beating MTP, but honest single-user GB10 numbers are 1.08–1.3× over MTP on novel code (2.2× only on repetitive text), and prose can regress. Do MTP first, DSpark as a later experiment on the same verification infra.
+- **"DSpark2" does not exist** — no paper, repo, or vendor feature by that name (likely conflated with DFlash-V2 draft checkpoints or the DeepSpec training repo).
+- **Engineering scope in FreeToken (est. 2–4 weeks for MTP-1/2, greedy-first):** (1) stop dropping `mtp.*` weights and map the MTP layer's experts into FTW banks (it is itself a MoE layer); (2) draft loop after each target step; (3) multi-token verification step — currently the engine samples exactly 1 token/seq/step (`engine/engine.py:927-931`) with CUDA graphs at bs 1/2/4, so verification needs new graph shapes (bs × draft-len) and FlashInfer's multi-token decode path; (4) rollback: paged KV truncation is easy for the 10 full-attention layers, but the 30 gated-delta linear-attention layers need per-step recurrent-state checkpointing — FreeToken's semantic-anchor state checkpoint machinery is the natural base, extended to per-token granularity during verification windows; (5) accept/reject sampling. Realistic target: ~63 → ~95–120 tok/s single-user at accept ≈ 1.8–2.
+- Caveat from llama.cpp-on-Spark reports: MTP can hurt batched throughput at concurrency ≥ 4 — gate it on batch size.
+
+Remaining Phase 3 candidates otherwise unchanged, plus: report the b12x int32 overflow upstream to flashinfer (draft ready).
 
 ## 7. Sources
 
