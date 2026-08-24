@@ -1,0 +1,12 @@
+# Keep the Docker build context lean. The wheel build runs with
+# FREETOKEN_BUILD_NO_STAMP=1, so .git is not needed inside the context.
+.git
+.venv
+venv
+dist
+build
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+assets
+freetoken-kernel-cache/freetoken_kernel_cache/jit_cache

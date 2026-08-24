@@ -1,0 +1,39 @@
+# FreeToken on DGX Spark.
+#
+#   docker compose -f docker/docker-compose.yml up --build
+#
+# Set FT_MODEL (env or .env file) to a model directory visible under /models.
+services:
+  freetoken:
+    image: freetoken-dgx-spark:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    gpus: all
+    # The engine pins multi-GB host expert banks (cudaHostRegister) and uses
+    # pinned staging buffers; Docker's default memlock cap is far too small.
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    environment:
+      FT_MODEL: ${FT_MODEL:-/models/Qwen3.6-35B-A3B}
+      # Spark's 128 GB is ONE pool shared by weights, caches, KV, and the OS.
+      # FreeToken's default --memory-ratio 0.9 assumes dedicated VRAM and will
+      # overcommit here; start conservative and raise after `ft bench bw`.
+      FT_EXTRA_ARGS: ${FT_EXTRA_ARGS:---memory-ratio 0.5}
+    volumes:
+      - ${FT_MODELS_DIR:-~/models}:/models
+      - freetoken-home:/root/.freetoken
+    ports:
+      - "1919:1919"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:1919/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 600s
+      retries: 3
+
+volumes:
+  freetoken-home:
