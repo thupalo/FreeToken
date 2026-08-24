@@ -30,40 +30,51 @@ class GraphCaptureBuffer:
     # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
     fla_cu_seqlens: torch.Tensor
 
+    # Tokens per request the buffer was built for (1 = decode; T = MTP verify steps).
+    tokens_per_req: int = 1
+
     @classmethod
-    def init(cls, bs: int, vocab_size: int, device: torch.device) -> GraphCaptureBuffer:
+    def init(
+        cls, bs: int, vocab_size: int, device: torch.device, tokens_per_req: int = 1
+    ) -> GraphCaptureBuffer:
+        rows = bs * tokens_per_req
         return GraphCaptureBuffer(
-            input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
-            out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
-            positions=torch.zeros(bs, dtype=torch.int32, device=device),
-            logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
+            input_ids=torch.zeros(rows, dtype=torch.int32, device=device),
+            out_loc=torch.zeros(rows, dtype=torch.int32, device=device),
+            positions=torch.zeros(rows, dtype=torch.int32, device=device),
+            logits=torch.empty(rows, vocab_size, dtype=torch.float32, device=device),
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
-            fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
+            # GDN query indptr: arange(0, rows+1, T) -- a constant per captured bs.
+            fla_cu_seqlens=torch.arange(
+                0, rows + 1, tokens_per_req, dtype=torch.int32, device=device
+            ),
+            tokens_per_req=tokens_per_req,
         )
 
     def set_batch(self, batch: Batch) -> None:
         from freetoken.attention.linear import FLAMetadata
 
-        _slice = slice(batch.padded_size)
         bs = batch.padded_size
-        batch.input_ids = self.input_ids[_slice]
-        batch.out_loc = self.out_loc[_slice]
-        batch.positions = self.positions[_slice]
-        batch.linear_table_idx = self.table_idx[_slice]
+        rows = bs * self.tokens_per_req
+        batch.input_ids = self.input_ids[:rows]
+        batch.out_loc = self.out_loc[:rows]
+        batch.positions = self.positions[:rows]
+        batch.linear_table_idx = self.table_idx[:bs]
         # Decode GDN metadata reads the persistent cu_seqlens (constant arange) and the
         # persistent table_idx slot map, so the captured kernels see stable addresses.
         batch.fla_metadata = FLAMetadata(
-            cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[_slice]
+            cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[:bs]
         )
 
     def copy_from(self, batch: Batch) -> None:
-        _slice = slice(batch.padded_size)
-        self.input_ids[_slice] = batch.input_ids
+        bs = batch.padded_size
+        rows = bs * self.tokens_per_req
+        self.input_ids[:rows] = batch.input_ids
         if batch.out_loc is not None:
-            self.out_loc[_slice] = batch.out_loc
-        self.positions[_slice] = batch.positions
+            self.out_loc[:rows] = batch.out_loc
+        self.positions[:rows] = batch.positions
         if batch.linear_table_idx is not None:
-            self.table_idx[_slice] = batch.linear_table_idx
+            self.table_idx[:bs] = batch.linear_table_idx
 
 
 def _determine_cuda_graph_bs(
@@ -106,7 +117,11 @@ class GraphRunner:
         vocab_size: int,
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
+        verify_tokens: int = 0,
     ) -> None:
+        # MTP verify steps (T tokens per request) get their own graph family, keyed
+        # ("verify", bs). 0 = no verify graphs.
+        self.verify_tokens = verify_tokens
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
@@ -184,16 +199,78 @@ class GraphRunner:
             self.graph_map[bs] = graph
 
         self._reset_moe_offload_cache()
+        if self.verify_tokens > 1:
+            self._capture_verify_graphs(vocab_size, model, pool)
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+
+    def _capture_verify_graphs(self, vocab_size: int, model: BaseLLMModel, pool) -> None:
+        """MTP verify graphs: T tokens per request. The attention backend sees a verify
+        batch as bs*T single-query pseudo-requests, so it needs a decode graph wrapper for
+        bs*T rows -- only batch sizes whose bs*T is itself a captured decode size get a
+        verify graph (bs in {1,2,4} at T=2 -> rows {2,4,8})."""
+        import copy
+
+        T = self.verify_tokens
+        self.verify_bs_list = sorted(
+            bs for bs in self.graph_bs_list if bs * T in self.attn_backend.capture_bs
+        )
+        if not self.verify_bs_list:
+            return logger.info_rank0("No verify CUDA graphs: no matching decode sizes.")
+        self.verify_buffer = GraphCaptureBuffer.init(
+            max(self.verify_bs_list), vocab_size, self.device, tokens_per_req=T
+        )
+        self.verify_hidden: Dict[int, torch.Tensor | None] = {}
+        self._model = model
+        # A verify dummy: same slots as the decode dummy, extend_len == T.
+        vdummy = copy.copy(self.dummy_req)
+        vdummy.device_len = vdummy.cached_len + T
+        self.verify_dummy_req = vdummy
+        dummy_slot = (vdummy.linear_slot_idx if vdummy.linear_slot_idx is not None
+                      else vdummy.table_idx)
+        logger.info_rank0(f"Capturing MTP verify graphs (T={T}) for bs {self.verify_bs_list}")
+        for bs in sorted(self.verify_bs_list, reverse=True):
+            graph = torch.cuda.CUDAGraph()
+            batch = Batch(reqs=[vdummy] * bs, phase="verify")
+            batch.padded_reqs = batch.reqs
+            self.attn_backend.prepare_for_capture(batch)
+            self.verify_buffer.set_batch(batch)
+            self.verify_buffer.table_idx[:bs].fill_(dummy_slot)
+            rows = bs * T
+            with get_global_ctx().forward_batch(batch):
+                self.verify_buffer.logits[:rows] = model.forward()
+                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                    self.verify_buffer.logits[:rows] = model.forward()
+                self._reset_moe_offload_cache()
+            self.graph_map[("verify", bs)] = graph
+            # The MTP draft pass (eager, after replay) reads model._mtp_hidden, which
+            # model.forward() stashes -- but a replay never runs model.forward(), so keep
+            # the graph-owned hidden buffer per size and re-stash it on every replay.
+            self.verify_hidden[bs] = getattr(model, "_mtp_hidden", None)
+        self._reset_moe_offload_cache()
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         if ENV.DISABLE_CUDA_GRAPH:  # profiling knob: force eager
             return False
+        if getattr(batch, "is_verify", False):
+            return (
+                self.verify_tokens > 1
+                and bool(getattr(self, "verify_bs_list", None))
+                and batch.size <= max(self.verify_bs_list)
+                and all(r.extend_len == self.verify_tokens for r in batch.reqs)
+            )
         return batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
+        if getattr(batch, "is_verify", False):
+            self.verify_buffer.copy_from(batch)
+            bs = batch.padded_size
+            g = self.graph_map[("verify", bs)]
+            self.attn_backend.prepare_for_replay(batch)
+            g.replay()
+            self._model._mtp_hidden = self.verify_hidden[bs]
+            return self.verify_buffer.logits[: batch.size * self.verify_tokens]
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
@@ -201,11 +278,14 @@ class GraphRunner:
         return self.buffer.logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
-        padded_size = (  # choose the first available batch size
-            next(bs for bs in self.graph_bs_list if bs >= batch.size)
-            if self.can_use_cuda_graph(batch)
-            else batch.size
-        )
+        if not self.can_use_cuda_graph(batch):
+            batch.padded_reqs = batch.reqs
+            return
+        if getattr(batch, "is_verify", False):
+            padded_size = next(bs for bs in self.verify_bs_list if bs >= batch.size)
+            batch.padded_reqs = batch.reqs + [self.verify_dummy_req] * (padded_size - batch.size)
+            return
+        padded_size = next(bs for bs in self.graph_bs_list if bs >= batch.size)
         batch.padded_reqs = batch.reqs + [self.dummy_req] * (padded_size - batch.size)
 
     # NOTE: This must be called before freeing NCCL resources to prevent program hang

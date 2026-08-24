@@ -440,6 +440,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            verify_tokens=2 if self.mtp_head is not None else 0,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -937,6 +938,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            verify_tokens=2 if self.mtp_head is not None else 0,
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
@@ -993,9 +995,10 @@ class Engine:
                 # complete_one here.
                 if profile:
                     ev[1].record(self.stream)
-                sampled = logits.argmax(dim=-1).to(torch.int32)
+                rows = 2 * batch.size  # padded graph batches carry extra dummy rows
+                sampled = logits[:rows].argmax(dim=-1).to(torch.int32)
                 b0, b1 = sampled[0::2], sampled[1::2]
-                candidates = batch.input_ids[1::2].to(torch.int32)
+                candidates = batch.input_ids[:rows][1::2].to(torch.int32)
                 accept = b0 == candidates
                 if profile:
                     ev[2].record(self.stream)
@@ -1055,7 +1058,14 @@ class Engine:
         marginally; it cannot affect correctness (verification is exact)."""
         model = self.model
         hidden = model._mtp_hidden  # [rows, hidden], stashed by model.forward
-        last_idx = batch.attn_metadata.get_last_indices(batch.size)
+        if batch.is_verify:
+            # Verify rows are T per request, uniform; attention metadata presents them as
+            # T pseudo-requests, so derive the last-row index from the row layout. Under a
+            # padded graph replay hidden has padded rows: keep the first bs requests.
+            t = hidden.shape[0] // batch.padded_size
+            last_idx = torch.arange(t - 1, t * batch.size, t, device=hidden.device)
+        else:
+            last_idx = batch.attn_metadata.get_last_indices(batch.size)
         shifted = torch.roll(batch.input_ids, -1)
         shifted[last_idx] = next_last_gpu.to(shifted.dtype)
         embeds = model.model.embed_tokens.forward(shifted)

@@ -855,7 +855,9 @@ class Scheduler(SchedulerIOMixin):
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
         if self.engine.linear_state_pool is not None:
-            if batch.is_decode:
+            if batch.is_decode or (
+                batch.is_verify and self.engine.graph_runner.can_use_cuda_graph(batch)
+            ):
                 # GPU GDN-state slot (one per padded request) for the decode gather/scatter;
                 # lands in the CUDA-graph input buffer via copy_from. Gate on the cache mode,
                 # NOT on whether any padded req has a linear_slot_idx -- the persistent dummy

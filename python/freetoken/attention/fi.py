@@ -224,15 +224,54 @@ class FlashInferBackend(BaseAttnBackend):
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
+        CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
+        device = self.device
+        page_table = get_global_ctx().page_table
+
+        if getattr(batch, "is_verify", False):
+            # MTP verify (T tokens per request, T small): run the DECODE kernel instead of the
+            # prefill FMHA by presenting each request as T single-query pseudo-requests that
+            # share its page-table row with growing KV lengths cached+1 .. device_len. All T
+            # tokens' K/V are stored before the attention call (store_kv precedes run), so
+            # query j attends exactly positions [0, cached+j] -- causal within the step by
+            # construction. Same decode wrapper/plan machinery as a plain decode batch.
+            seqlens_k = [
+                req.cached_len + j + 1 for req in reqs for j in range(req.extend_len)
+            ]
+            n_rows = len(seqlens_k)
+            seq_len_cpu = torch.tensor(seqlens_k, **CPU_KWARGS)
+            cu_seqlens_k_cpu = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
+            cu_seqlens_q_cpu = torch.arange(0, n_rows + 1, **CPU_KWARGS)
+            indices = torch.cat(
+                [
+                    page_table[req.table_idx, : req.cached_len + j + 1]
+                    for req in reqs
+                    for j in range(req.extend_len)
+                ]
+            )
+            batch.attn_metadata = FIMetadata(
+                cu_seqlens_q_cpu=cu_seqlens_q_cpu,
+                cu_seqlens_k_cpu=cu_seqlens_k_cpu,
+                cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
+                indices=indices,
+                last_page_len_cpu=self._get_ones_cpu(n_rows),
+                num_qo_heads=self.qo_head_local,
+                num_kv_heads=self.kv_head_local,
+                head_dim=self.config.head_dim,
+                page_size=1,
+                pos_encoding_mode="NONE",
+                seq_lens_cpu=seq_len_cpu,
+                dtype=self.kvcache.dtype,
+                wrapper=self.decode_wrappers,
+            )
+            return
 
         padded_size = len(reqs)
         seqlens_q = [req.extend_len for req in reqs]
         seqlens_k = [req.device_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
         max_seqlen_q = max(seqlens_q)
-        CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
 
-        device = self.device
         seq_len_cpu = torch.tensor(seqlens_k, **CPU_KWARGS)
         cu_seqlens_k_cpu = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
         if max_seqlen_q == 1:  # decode with all extend_len = 1
@@ -242,7 +281,6 @@ class FlashInferBackend(BaseAttnBackend):
         else:  # normal extend prefill, with partial cache hit
             cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
 
-        page_table = get_global_ctx().page_table
         batch.attn_metadata = FIMetadata(
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
@@ -286,28 +324,33 @@ class FlashInferBackend(BaseAttnBackend):
     def prepare_for_capture(self, batch: Batch) -> None:
         from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
 
-        bs = batch.size
-        assert bs in self.capture_bs and bs not in self.graph_wrappers and self.capture
-        capture = self.capture
-        self.graph_wrappers[bs] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
-            self.float_workspace_buffer,
-            kv_layout="NHD",
-            use_tensor_cores=self.use_tensor_cores,
-            indptr_buffer=capture.cu_seqlens_k[: bs + 1],
-            indices_buffer=capture.indices,
-            last_page_len_buffer=capture.one_tensor[:bs],
-        )
-        self.graph_wrappers[bs]._backend = "fa2"
-        self.graph_wrappers[bs]._int_workspace_buffer = self.int_workspace_buffer
         self.prepare_metadata(batch)
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
-        metadata.wrapper = self.graph_wrappers[bs]
+        # Graph wrappers are keyed by the number of single-query rows the kernel sees:
+        # == batch size for decode, bs*T pseudo-requests for MTP verify (which therefore
+        # reuses the decode wrapper of the matching size when one already exists).
+        rows = int(metadata.seq_lens_cpu.numel())
+        assert rows in self.capture_bs and self.capture
+        if rows not in self.graph_wrappers:
+            capture = self.capture
+            self.graph_wrappers[rows] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
+                self.float_workspace_buffer,
+                kv_layout="NHD",
+                use_tensor_cores=self.use_tensor_cores,
+                indptr_buffer=capture.cu_seqlens_k[: rows + 1],
+                indices_buffer=capture.indices,
+                last_page_len_buffer=capture.one_tensor[:rows],
+            )
+            self.graph_wrappers[rows]._backend = "fa2"
+            self.graph_wrappers[rows]._int_workspace_buffer = self.int_workspace_buffer
+        metadata.wrapper = self.graph_wrappers[rows]
         self._initialize_metadata_once(metadata)
 
     def prepare_for_replay(self, batch: Batch) -> None:
-        metadata, bs = batch.attn_metadata, batch.padded_size
+        metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata) and not metadata.initialized
-        assert self.capture is not None and bs in self.capture_bs
-        metadata.wrapper = self.graph_wrappers[bs]
+        rows = int(metadata.seq_lens_cpu.numel())
+        assert self.capture is not None and rows in self.capture_bs
+        metadata.wrapper = self.graph_wrappers[rows]
         self._initialize_metadata_once(metadata)

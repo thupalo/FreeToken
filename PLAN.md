@@ -205,6 +205,16 @@ Conclusions:
   serving (sparkrun's readiness probe raced the load). Bar to beat on this board: tg32 142.8
   (vLLM marlin+MTP), pp2048 6382 (vLLM 0.27.2 b12x+MTP).
 
+- **M4 landed (2026-08-24 evening)**: (a) verify attention runs through the FlashInfer
+  *decode* wrapper as T single-query pseudo-requests per request (byte-identical to the
+  prefill-FMHA path); (b) verify steps are CUDA-graph captured, keyed ("verify", bs),
+  reusing the decode capture path (buffers sized bs*T rows, `fla_cu_seqlens =
+  arange(0, rows+1, T)`, graph-owned `_mtp_hidden` re-stashed on replay). Result, bs=1
+  greedy MTP-1: **82.6 / 77.6 / 71.9 tok/s** (repetitive/code/prose) vs 60–63 plain —
+  **+24–31%**, outputs identical to eager, acceptance 85.6%, step 26 → 20.1 ms
+  (target fwd 17.1 ms + eager draft 2.5 ms). Next: capture the draft pass too (~-3 ms),
+  M3 multi-draft (k=2–3), NVFP4 gemm-vs-gemv at M=2.
+
 Remaining Phase 3 candidates otherwise unchanged. The b12x int32 overflow was reported upstream: [flashinfer#4706](https://github.com/flashinfer-ai/flashinfer/issues/4706) (checked distinct from #2776/#3383 before filing).
 
 ## 7. Sources
