@@ -215,6 +215,20 @@ Conclusions:
   (target fwd 17.1 ms + eager draft 2.5 ms). Next: capture the draft pass too (~-3 ms),
   M3 multi-draft (k=2–3), NVFP4 gemm-vs-gemv at M=2.
 
+- **sparkrun harness, clean run (spark2, image r2 = 95a8293, default profile, TP1)**:
+  **tg32 = 65.6 ± 0.3 tok/s, pp2048 = 1963 ± 48 tok/s, TTFT 1048 ms** (plain FreeToken, no
+  MTP). Board: vLLM marlin+MTP tg32 142.8; vLLM 0.27.2 b12x+MTP pp2048 6382 / TTFT 323 ms.
+  Two sparkrun gotchas fixed on the way: it pins the image SHA per benchmark id (clear
+  `~/.cache/sparkrun/benchmarks/bench_*`), and it resolves `container:` on the CONTROL host —
+  a tag present only on the target silently falls back to the vLLM default image (sync with
+  `ssh spark2 docker save TAG | docker load`).
+- **FP8 dense projections A/B** (`FREETOKEN_FP8_W8A16=1`): triton W8A16 60.2/62.9 vs cuBLASLt
+  W8A8 60.1/63.6 tok/s — no difference; `_scaled_mm`'s ~6.5 ms/step is real bandwidth.
+- **M4 addendum**: capturing the draft/accept post-processing in the verify graph is correct
+  but wall-neutral (the eager draft was already overlapped); step is GPU-bound at ~19.6 ms.
+  Next lever is M3 (k=2 drafts): with 85% per-draft acceptance, ~2.6 tokens/step at ~+4 ms
+  → ~105 tok/s projected.
+
 Remaining Phase 3 candidates otherwise unchanged. The b12x int32 overflow was reported upstream: [flashinfer#4706](https://github.com/flashinfer-ai/flashinfer/issues/4706) (checked distinct from #2776/#3383 before filing).
 
 ## 7. Sources
