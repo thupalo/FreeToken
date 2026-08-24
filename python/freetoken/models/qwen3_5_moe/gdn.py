@@ -172,7 +172,9 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode or getattr(batch, "is_verify", False):
+        import os as _os
+        _vpath = _os.environ.get("FREETOKEN_MTP_GDN_PATH", "decode")  # decode|mixed|chunk (debug)
+        if batch.is_decode or (getattr(batch, "is_verify", False) and _vpath != "chunk"):
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
@@ -182,17 +184,34 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             # chunk-prefill path for verification, whose per-layer host overhead dominated.
             if batch.is_decode:
                 mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
+            elif _vpath == "mixed":
+                mixed = self._conv_prefill(
+                    conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state
+                ).contiguous()
             else:
                 n_req = fla.cache_indices.shape[0]
                 t_per = total // n_req
                 x3 = conv_in.view(n_req, t_per, -1).transpose(1, 2)  # [B, conv_dim, T]
                 mixed = self._conv_decode(x3, fla.cache_indices, pool)  # [B, conv_dim, T]
-                mixed = mixed.transpose(1, 2).reshape(total, -1)
+                # .contiguous(): for bs=1 the transpose+reshape is a strided VIEW (token
+                # stride 1, feature stride T) and the fused decode kernel models only the
+                # token stride -- it read interleaved garbage until this copy was added.
+                mixed = mixed.transpose(1, 2).reshape(total, -1).contiguous()
             n_tok = mixed.shape[0]
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, n_tok, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, n_tok, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, n_tok, self.num_v_heads, self.head_v_dim).to(dtype)
+            # The fused decode kernel indexes heads/features with fixed K/V strides: feed it
+            # contiguous tensors (split views of ``mixed`` are row-strided).
+            q = qf.reshape(1, n_tok, self.num_k_heads, self.head_k_dim).to(dtype).contiguous()
+            k = kf.reshape(1, n_tok, self.num_k_heads, self.head_k_dim).to(dtype).contiguous()
+            v = vf.reshape(1, n_tok, self.num_v_heads, self.head_v_dim).to(dtype).contiguous()
+            if _os.environ.get("FREETOKEN_MTP_GDN_DUMP") and not batch.is_decode and li == 0 \
+                    and not getattr(Qwen3_5GatedDeltaNet, "_dumped", False):
+                Qwen3_5GatedDeltaNet._dumped = True
+                torch.save({"q": q, "k": k, "v": v, "a": a, "b": b, "z": z, "A_log": self.A_log,
+                            "dt_bias": self.dt_bias, "cu": fla.cu_seqlens, "idx": fla.cache_indices,
+                            "state": pool.recurrent_states[li].clone(), "scale": self.head_k_dim ** -0.5,
+                            "conv_in": conv_in, "mixed": mixed},
+                           _os.environ["FREETOKEN_MTP_GDN_DUMP"])
             core_out = gdn_decode_fla(
                 q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
