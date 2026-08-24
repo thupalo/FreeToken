@@ -179,6 +179,8 @@ Conclusions:
   now the top competitive gap on this platform.
 - Validated target for FreeToken MTP: **~100–115 tok/s** single-user decode.
 
+**gpt-oss-120b bring-up (2026-08-24): works.** First-serve FTW conversion of the 61 GB MXFP4 checkpoint OK; decode 24.8 tok/s median (offload backend, triton attention, swa_radix cache). Second validated model for the container.
+
 Remaining Phase 3 candidates otherwise unchanged, plus: report the b12x int32 overflow upstream to flashinfer (draft ready).
 
 ## 7. Sources
