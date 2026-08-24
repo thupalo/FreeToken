@@ -146,6 +146,39 @@ Feasible and the highest-leverage Phase 3 item: decode is bandwidth-bound, and v
 - **Engineering scope in FreeToken (est. 2–4 weeks for MTP-1/2, greedy-first):** (1) stop dropping `mtp.*` weights and map the MTP layer's experts into FTW banks (it is itself a MoE layer); (2) draft loop after each target step; (3) multi-token verification step — currently the engine samples exactly 1 token/seq/step (`engine/engine.py:927-931`) with CUDA graphs at bs 1/2/4, so verification needs new graph shapes (bs × draft-len) and FlashInfer's multi-token decode path; (4) rollback: paged KV truncation is easy for the 10 full-attention layers, but the 30 gated-delta linear-attention layers need per-step recurrent-state checkpointing — FreeToken's semantic-anchor state checkpoint machinery is the natural base, extended to per-token granularity during verification windows; (5) accept/reject sampling. Realistic target: ~63 → ~95–120 tok/s single-user at accept ≈ 1.8–2.
 - Caveat from llama.cpp-on-Spark reports: MTP can hurt batched throughput at concurrency ≥ 4 — gate it on batch size.
 
+### Speculative decoding EVALUATION results (2026-08-24, empirical)
+
+Measured on this box with the official llama.cpp `server-cuda` arm64 image
+(build 10603), Qwen3.6-35B-A3B MXFP4_MOE GGUF with embedded MTP head
+(unsloth MTP-GGUF), full GPU offload, greedy decoding, median of 3 × 256-token
+runs per content type. DSpark drafter: williamliao Q8_0 GGUF (556 MB,
+RedHatAI-lineage). Production FreeToken container stopped during runs.
+
+| config | repetitive | code | prose | acceptance / mean accepted len |
+|---|---|---|---|---|
+| baseline (no spec) | 62.7 | 62.7 | 62.9 | — |
+| MTP, 2 drafts | 91.1 | 82.9 | 94.0 | 98.3% / 2.97 |
+| **MTP, 3 drafts** | **112.2** | **95.9** | **109.3** | 96.9% / 3.91 |
+| MTP, 3 drafts + p-min 0.75 | 81.5 | 76.3 | 108.7 | 100% / 4.00 (too few drafts issued) |
+| DSpark (dedicated drafter) | 115.5 | 99.2 | 114.6 | 93.0% / 3.79 |
+
+Conclusions:
+- **Go for the FreeToken MTP implementation.** The model's built-in MTP head at
+  3 drafts delivers 1.5–1.8× (avg ~1.7×) over baseline and lands within 3% of
+  DSpark — with no extra drafter model, no extra weight traffic, and weights we
+  already ship (currently dropped at load). Acceptance is far above published
+  figures (97–98% vs 85–93%), so 4–5 drafts may push further.
+- The confidence floor (`p-min 0.75`) *hurts* on GB10 — the head is
+  well-calibrated; gating drafts wastes bandwidth-amortization opportunity.
+- DSpark works out of the box in llama.cpp and is the ceiling reference
+  (~1.6–1.8×); as a FreeToken feature it would add a separate drafter pipeline
+  for ≤3% gain — not worth it before MTP ships.
+- Current llama.cpp (Aug build) baseline is 62.7–62.9 tok/s — it caught up with
+  FreeToken (63.5) since the April build (59.4). With MTP it reaches ~96–112
+  tok/s TODAY, which FreeToken cannot match until MTP is implemented; this is
+  now the top competitive gap on this platform.
+- Validated target for FreeToken MTP: **~100–115 tok/s** single-user decode.
+
 Remaining Phase 3 candidates otherwise unchanged, plus: report the b12x int32 overflow upstream to flashinfer (draft ready).
 
 ## 7. Sources
