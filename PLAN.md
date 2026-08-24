@@ -110,7 +110,33 @@ Multi-stage Dockerfile, conservative kernel choices (no sgl-kernel):
 - Tuned, benchmarked, documented v1: **~2–3 weeks**
 - With sm_121a sgl-kernel rebuild + unified-memory fast path + CI: **~4–5 weeks**
 
-## 6. Sources
+## 6. Progress log
+
+**2026-08-24 — Phase 0+1 complete, Phase 2 mostly complete** (executed natively on a DGX Spark: GB10, driver 580.173.02, CUDA 13.0, 120 GB, DGX OS).
+
+Phase 0/1: fork `thupalo/FreeToken` branch `feat/dgx-spark`; image `freetoken-dgx-spark` (19.2 GB) builds in ~12 min with native sm_121 SASS (verified via cuobjdump); serving Qwen3.6-35B-A3B-NVFP4 works via OpenAI + Anthropic APIs.
+
+Phase 2 configuration sweep (Qwen3.6-35B-A3B-NVFP4, median of 3 warm runs):
+
+| config | startup | decode tok/s | TTFT | prefill tok/s (4k prompt) |
+|---|---|---|---|---|
+| ratio 0.5, triton (default) | 47 s | **63.5** | 0.35 s | 1062 |
+| ratio 0.7, triton | 50 s | 63.7 | 0.35 s | 1065 |
+| ratio 0.85, triton | 129 s | 63.2 | 0.36 s | 1110 |
+| ratio 0.7, b12x (`--nvfp4-backend flashinfer`) | **fails** | — | — | — |
+| ratio 0.7, + OpenAI triton_kernels router | 61 s | 62.5 | 0.35 s | 813 |
+| ratio 0.7, `FREETOKEN_BANK_CUDA_ALLOC=1` | 50 s | 62.9 | 0.36 s | 1059 |
+
+Findings:
+- **Defaults win.** Decode is memory-bandwidth-bound at ~63 tok/s and invariant to cache size, bank allocation, and router — the unified-memory prediction confirmed empirically (cache hit and miss read the same LPDDR5x). `--memory-ratio 0.5` keeps fastest startup and most free RAM. 63 tok/s sits between the paper's RTX 4090 (42.9) and RTX 5090 (76.7) numbers for this model.
+- **b12x backend broken on GB10 for this model**: `OverflowError: Value overflow: 2684354560 exceeds range of l` in `nvidia_cutlass_dsl` `build_memref_desc` via `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_w4a16_kernel.py` — a ~2.5 GiB expert-bank tensor descriptor overflows a 32-bit field that smaller-VRAM RTX 50 setups never hit. Upstream (flashinfer/cutlass-dsl) bug; `triton` NVFP4 backend is the backend of record.
+- **`ft bench bw` on GB10**: C2C "PCIe" gather 78–85 GB/s, CPU STREAM 103 GB/s, scalar-ARM CPU-MoE 9–34 GB/s → auto-picks `offload` for every format, as designed.
+- **Tests**: `tests/kernels` + `tests/moe` in-container: 303 passed, 4 skipped, 0 failed — no Triton sm_121a ptxas issues in FreeToken's kernel set.
+- **Ops gotchas** (documented in docker/README.md): GB10 `cudaMemGetInfo` ignores reclaimable page cache → "cache budget too small" after big downloads (fix: drop_caches); bench-bw profile persisted via `XDG_CACHE_HOME` in the volume; page size is 4 K (FTW O_DIRECT assumption holds); PyPI's `triton-kernels` package is NOT OpenAI's `triton_kernels` (name collision — install from the triton repo subdirectory if ever needed).
+
+Remaining Phase 2: llama.cpp (MXFP4_MOE GGUF) head-to-head. Phase 3 candidates unchanged, plus: report the b12x int32 overflow upstream to flashinfer.
+
+## 7. Sources
 
 - Repo: cloned at `FreeToken/` (commit `bd372b6`); paper: `2608.16157.pdf`
 - SGLang on Spark: github.com/sgl-project/sglang/issues/11658; vLLM sm_121 tracking: vllm#31128, #36821
