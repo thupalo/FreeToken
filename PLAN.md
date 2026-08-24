@@ -229,6 +229,11 @@ Conclusions:
   Next lever is M3 (k=2 drafts): with 85% per-draft acceptance, ~2.6 tokens/step at ~+4 ms
   → ~105 tok/s projected.
 
+- **sparkrun harness, MTP k=1 (spark2, image r3 = 90f02d2, `--sampling-defaults none`)**:
+  **tg32 = 91.0 ± 0.5 tok/s** (+39% over plain 65.6), pp2048 1868 ± 123, TTFT 1106 ms.
+  Board: vLLM marlin+MTP 142.8, vLLM b12x+MTP 129.6. Gap now dominated by draft count (k=1
+  vs vLLM's 3) and prefill (1.9k vs 6.4k tok/s).
+
 Remaining Phase 3 candidates otherwise unchanged. The b12x int32 overflow was reported upstream: [flashinfer#4706](https://github.com/flashinfer-ai/flashinfer/issues/4706) (checked distinct from #2776/#3383 before filing).
 
 ## 7. Sources
