@@ -71,6 +71,19 @@ curl -s http://localhost:1919/v1/chat/completions -H 'Content-Type: application/
 | DeepSeek-V4-Flash | MXFP4 (~140 GB pool) | no |
 | GLM-5.2 | NVFP4 (433 GB) | no |
 
+### Troubleshooting: "cache budget too small" at startup
+
+On GB10, `cudaMemGetInfo` reports only truly-free RAM — it does **not** count
+reclaimable page cache. After large downloads or image builds, tens of GB sit
+in page cache and the engine may see just a few GB of "free GPU memory", then
+fail budget planning. Fix on the **host** before starting the container:
+
+```bash
+sudo sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'
+```
+
+The entrypoint prints a warning when it detects a large reclaimable-cache gap.
+
 ### Useful tuning environment variables
 
 - `FT_MODEL`, `FT_HOST`, `FT_PORT`, `FT_EXTRA_ARGS` — entrypoint knobs

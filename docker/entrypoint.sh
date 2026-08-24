@@ -23,6 +23,22 @@ if [ "$memlock" != "unlimited" ]; then
     echo "[entrypoint] or set FREETOKEN_PIN_BUDGET_GB to cap pinned bank bytes." >&2
 fi
 
+# GB10 unified-memory gotcha: cudaMemGetInfo counts only truly-free RAM, not
+# reclaimable page cache, and FreeToken sizes its caches from that number. A
+# box with tens of GB in page cache (image pulls, model downloads) will report
+# a few GB "free GPU memory" and fail budget planning with "cache budget too
+# small". Warn when the gap is large; the host-side fix is
+# `sudo sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'` before starting.
+read -r _ mem_avail_kb < <(grep MemAvailable /proc/meminfo | awk '{print $1" "$2}') || mem_avail_kb=0
+read -r _ mem_free_kb < <(grep MemFree /proc/meminfo | awk '{print $1" "$2}') || mem_free_kb=0
+if [ "${mem_avail_kb:-0}" -gt 0 ] && [ $((mem_avail_kb - mem_free_kb)) -gt $((32 * 1024 * 1024)) ]; then
+    echo "[entrypoint] WARNING: $(((mem_avail_kb - mem_free_kb) / 1024 / 1024)) GiB of RAM is reclaimable page cache." >&2
+    echo "[entrypoint] The CUDA driver does not count it as free, so FreeToken's memory" >&2
+    echo "[entrypoint] budget may come out too small. If startup fails with 'cache budget" >&2
+    echo "[entrypoint] too small', drop caches on the HOST first:" >&2
+    echo "[entrypoint]   sudo sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'" >&2
+fi
+
 if [ "$#" -eq 0 ]; then
     if [ -z "${FT_MODEL:-}" ]; then
         echo "[entrypoint] ERROR: FT_MODEL is not set." >&2
