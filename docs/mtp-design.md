@@ -90,3 +90,35 @@ empirical ceiling measured via llama.cpp MTP-3 on the same box: 96–112 tok/s a
 - `[K,V]` vs `[V,K]` transpose coincidence at head_k==head_v==128
   (`gdn.py:60-65`) — intermediate-state copies must follow `_write_track_snapshot`.
 - `ChunkedReq` is the precedent for Req subclasses with altered step semantics.
+
+## M4 findings (2026-08-24) — kernel choice before graphs
+
+Profiling an eager verify step (bs=1, k=1) reordered the plan:
+
+- Eager 1-token decode costs 18.8 ms vs 16 ms graphed: launch overhead is ~3 ms,
+  **not** the 13 ms gap to the verify step. The gap was kernel *choice*: the
+  `verify` phase originally rode the prefill-path kernels, which are the wrong
+  tool for 2 tokens — `ChunkGatedDeltaRuleFunction` cost ~8 ms of host time
+  across 30 GDN layers for 1.4 ms of GPU work, and FlashInfer's prefill FMHA
+  ~4.6 ms for 10 layers of 2-query attention.
+- **GDN**: verify now uses the fused FLA *decode* kernel (varlen, T steps per
+  sequence in-kernel) plus the triton conv update in multi-token mode
+  (`seqlen=T`). Caveat that cost a day: the fused kernel models only the
+  token stride; feed it contiguous q/k/v (a bs=1 transpose+reshape yields a
+  strided view). Step: 35 → 26 ms.
+- **Attention**: verify is presented to FlashInfer as `T` single-query
+  pseudo-requests per request sharing the page-table row with KV lengths
+  cached+1..device_len (all T K/V rows are stored before the attention call, so
+  causality within the step holds by construction) → the fast decode kernel and
+  the same wrapper/plan machinery as a decode batch. This also makes the verify
+  step graph-capturable through the existing decode capture path
+  (`FICaptureData` + `CUDAGraphBatchDecodeWithPagedKVCacheWrapper`) once the
+  capture buffers are sized for `bs*T` rows and `fla_cu_seqlens = arange(0,
+  bs*T+1, T)`.
+- Remaining: `aten::_scaled_mm` (FP8 W8A8 dense projections) at M=2 — 6.5 ms;
+  then CUDA-graph capture of the verify step keyed by (bs, T).
+
+Debug knobs: `FREETOKEN_MTP_PROFILE=1` (per-step event breakdown + one-step
+kernel table), `FREETOKEN_MTP_GDN_PATH=decode|mixed|chunk`,
+`FREETOKEN_MTP_GDN_DUMP=<path>` (in-situ tensor dump of layer 0's first verify
+step), `FREETOKEN_DISABLE_CUDA_GRAPH=1`.
