@@ -953,6 +953,18 @@ class Engine:
         mtp_out: MtpStepOutput | None = None
         profile = ENV.MTP_PROFILE and batch.is_verify
         stack = contextlib.ExitStack()
+        # Plain eager decode (FREETOKEN_DISABLE_CUDA_GRAPH=1) gets the same one-step kernel
+        # dump so the 1-token decode kernels can be compared against the verify step's.
+        kprof_decode = ENV.MTP_PROFILE and batch.is_decode and ENV.DISABLE_CUDA_GRAPH
+        if kprof_decode:
+            n = self._prof_decode_n = getattr(self, "_prof_decode_n", 0) + 1
+            if n == 150:
+                prof = torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA]
+                )
+                stack.callback(self._dump_profiler, prof)
+                stack.enter_context(prof)
         if profile:
             ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
             wall0 = time.perf_counter()

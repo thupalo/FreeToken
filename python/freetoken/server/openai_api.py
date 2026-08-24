@@ -249,13 +249,21 @@ async def stream_chat_completion_chunks(
     """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
     if spec is None:
         spec = chat_request_to_genspec(req, {})
-    yield _sse(
-        _chat_chunk(
-            req,
-            uid,
-            [{"delta": {"role": "assistant", "content": ""}, "index": 0, "finish_reason": None}],
+    # The leading role chunk is emitted with the FIRST real event, not before prefill:
+    # clients and benchmark harnesses (llama-benchy) time "first response" on the first
+    # SSE chunk, and an immediate empty role delta reports a ~6 ms TTFT for a 1 s prefill
+    # (and a bogus prompt-throughput derived from it). vLLM emits the role with the first
+    # token; match that.
+    role_sent = False
+
+    def _role_chunk() -> bytes:
+        return _sse(
+            _chat_chunk(
+                req,
+                uid,
+                [{"delta": {"role": "assistant", "content": ""}, "index": 0, "finish_reason": None}],
+            )
         )
-    )
 
     prompt_tokens = 0
     completion_tokens = 0
@@ -275,6 +283,9 @@ async def stream_chat_completion_chunks(
                 {"error": {"message": str(exc), "type": "invalid_request_error", "code": exc.code}}
             )
             break
+        if not role_sent:
+            role_sent = True
+            yield _role_chunk()
         if isinstance(ev, ReasoningDelta):
             yield _sse(
                 _chat_chunk(
