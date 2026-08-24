@@ -181,6 +181,30 @@ Conclusions:
 
 **gpt-oss-120b bring-up (2026-08-24): works.** First-serve FTW conversion of the 61 GB MXFP4 checkpoint OK; decode 24.8 tok/s median (offload backend, triton attention, swa_radix cache). Second validated model for the container.
 
+### M4 progress log (2026-08-24/25)
+
+- **Profile of an eager verify step (bs=1, k=1)**: 22 ms GPU / 31 ms CPU — host-bound. GPU
+  +6 ms vs a decode step from small-M kernel variants (`aten::_scaled_mm` W8A8 at M=2 6.5 ms,
+  cutlass FMHA prefill wrapper ~4.6 ms, nvfp4 gemm-vs-gemv); host: `ChunkGatedDeltaRuleFunction`
+  ~8 ms across 30 GDN layers (1.4 ms of GPU work). Eager 1-token decode = 53.2 tok/s
+  (18.8 ms) vs 62.7 graphed → launch overhead is only ~3 ms; **kernel choice first, graphs last.**
+- GDN verify via the FLA *decode* kernel (varlen T=2) + multi-token conv update: step
+  35.4 → 26.1 ms, kernels pass parity offline (conv exact, GDN ≤ bf16 noise, bs=1/T=2,3) but
+  produce garbage in situ (mixed/decode paths identical garbage, chunk path fine) — root
+  cause under investigation with an in-situ tensor dump (FREETOKEN_MTP_GDN_PATH /
+  FREETOKEN_MTP_GDN_DUMP debug knobs).
+- **GPU+CPU `hybrid` MoE backend measured: 26.3 tok/s vs 62.7 offload** (scalar-ARM CPU
+  branch becomes the per-layer critical path; contends for the same LPDDR5x). Bandwidth-teaming
+  remains a research bet gated on a concurrent-bandwidth ceiling test (see discussion).
+- **sparkrun integration works**: recipe `/mnt/shared/spark/freetoken/freetoken-qwen3.6-nvfp4.yaml`
+  (runtime: vllm, `executor_config.entrypoint: ""`, HF-cache model id, cache env redirected
+  into /cache/runtime). First official-harness result on spark2 (default profile, TP1):
+  **tg32 = 61.0 ± 0.5 tok/s** (matches direct probes; tightest std on the board), pp2048 bogus
+  (2.2M t/s) because FreeToken streamed an empty role chunk before prefill (ttfr 6 ms) — fixed:
+  role chunk now goes out with the first token (commit 1f2c0c8); `/v1/models` returns 503 until
+  serving (sparkrun's readiness probe raced the load). Bar to beat on this board: tg32 142.8
+  (vLLM marlin+MTP), pp2048 6382 (vLLM 0.27.2 b12x+MTP).
+
 Remaining Phase 3 candidates otherwise unchanged. The b12x int32 overflow was reported upstream: [flashinfer#4706](https://github.com/flashinfer-ai/flashinfer/issues/4706) (checked distinct from #2776/#3383 before filing).
 
 ## 7. Sources
