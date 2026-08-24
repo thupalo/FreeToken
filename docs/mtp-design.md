@@ -122,3 +122,31 @@ Debug knobs: `FREETOKEN_MTP_PROFILE=1` (per-step event breakdown + one-step
 kernel table), `FREETOKEN_MTP_GDN_PATH=decode|mixed|chunk`,
 `FREETOKEN_MTP_GDN_DUMP=<path>` (in-situ tensor dump of layer 0's first verify
 step), `FREETOKEN_DISABLE_CUDA_GRAPH=1`.
+
+## M4 result (2026-08-24) — graph-captured verify steps
+
+Implemented (commit 4a3d416 + follow-up):
+
+- `GraphRunner` captures a second graph family keyed `("verify", bs)` for every
+  captured decode size `bs` whose `bs*T` rows is itself a captured decode size
+  (T=2: bs ∈ {1,2,4}). `GraphCaptureBuffer` gained `tokens_per_req` (rows =
+  `bs*T`; `fla_cu_seqlens = arange(0, rows+1, T)`). A verify dummy request
+  (copy of the decode dummy with `extend_len == T`) drives capture.
+- FlashInfer graph wrappers are keyed by pseudo-request *rows*; the verify
+  batch reuses the decode wrapper of size `bs*T`.
+- The post-processing (`Engine._verify_compute`: greedy argmax of both rows,
+  accept test, MTP draft pass incl. the MTP layer's attention through the same
+  wrapper) is captured right after the forward; on replay the graph-owned
+  result tensors come back via `batch._verify_graph_out`, and the graph-owned
+  `model._mtp_hidden` is re-stashed (a replay never runs `model.forward()`).
+- Scheduler stages `linear_table_idx` for graphed verify batches; padded rows
+  are sliced in the engine's verify path.
+
+Measured (GB10, bs=1, greedy, forward-only capture): 82.6 / 77.6 / 71.9 tok/s
+(repetitive / code / prose) vs 60–63 plain, byte-identical outputs to the eager
+path, acceptance 85.6%, step 26 → 20.1 ms.
+
+Remaining per-step costs after capture: target forward 17.1 ms (of which FP8
+`_scaled_mm` ~6.5 ms is also the biggest item of a plain decode step —
+A/B against the triton W8A16 path via `FREETOKEN_FP8_W8A16=1`), NVFP4 dense
+GEMM at M=2 ~1 ms over 2× GEMV, MTP draft 2.5 ms (now captured).
