@@ -131,6 +131,18 @@ def register_openai_routes(
     @app.get("/v1/models")
     async def v1_models():
         state = get_state()
+        # Readiness contract (vLLM-compatible): orchestrators and benchmark harnesses
+        # (sparkrun/llama-benchy) poll /v1/models == 200 as "the model is loaded". Answer
+        # 503 until the engine is actually serving so a client cannot race the load.
+        mstate = getattr(state, "maintenance_state", "serving")
+        if mstate != "serving":
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": f"model not ready: engine is {mstate}",
+                                   "type": "service_unavailable"}},
+            )
         model_id = _served_model_name(state)
         ctx = _model_context_length(state)
         efforts, default_effort = await _effort_fields(state)

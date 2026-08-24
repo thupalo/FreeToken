@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import gc
 import math
 import os
@@ -939,13 +940,35 @@ class Engine:
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        try:
+            return self._forward_batch_impl(batch, args)
+        finally:
+            st = getattr(self, '_prof_stack', None)
+            if st is not None:
+                self._prof_stack = None
+                st.close()
+
+    def _forward_batch_impl(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         mtp_out: MtpStepOutput | None = None
         profile = ENV.MTP_PROFILE and batch.is_verify
+        stack = contextlib.ExitStack()
         if profile:
             ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
             wall0 = time.perf_counter()
             ev[0].record(self.stream)
+            # One torch.profiler capture of step 150: per-kernel CUDA time table, to see
+            # WHICH kernels make the 2-token verify forward slow (dumped on stack exit,
+            # i.e. after the profiler closes -- callback registered before it is entered).
+            if getattr(self, "_prof_acc", {}).get("n") == 150:
+                prof = torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA]
+                )
+                stack.callback(self._dump_profiler, prof)
+                stack.enter_context(prof)
+        stack.__enter__()
+        self._prof_stack = stack
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
@@ -1027,6 +1050,10 @@ class Engine:
         mtp_hidden = self.mtp_head.forward(embeds, hidden)
         draft_logits = model.lm_head.project(mtp_hidden[last_idx])
         return draft_logits.argmax(dim=-1).to(torch.int32)
+
+    def _dump_profiler(self, prof) -> None:
+        table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=28)
+        logger.info("MTP verify-step kernel profile (one step):\n" + table)
 
     def _profile_verify(self, ev, wall0: float) -> None:
         """FREETOKEN_MTP_PROFILE=1: rolling GPU-time breakdown of the verify step

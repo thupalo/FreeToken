@@ -518,18 +518,24 @@ def causal_conv1d_varlen(
 
 
 def causal_conv1d_decode(
-    x: torch.Tensor,                # [batch, conv_dim]
+    x: torch.Tensor,                # [batch, conv_dim] or [batch, conv_dim, T] (multi-token)
     conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)
     weight: torch.Tensor,           # [conv_dim, kernel]
     conv_state_indices: torch.Tensor,  # [batch] int32
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
 ) -> torch.Tensor:
+    """Decode-style causal conv update. A 3-D ``x`` runs the kernel's multi-token mode
+    (``seqlen`` = T per request, conv state shifted by T) -- used by MTP verify steps,
+    which process a fixed small T per request through the decode kernels."""
     conv_state_indices = conv_state_indices.to(torch.int32)
     if isinstance(activation, bool):
         activation = "silu" if activation else None
 
-    x = x.unsqueeze(-1)  # [batch, dim, 1]
+    squeeze = x.dim() == 2
+    if squeeze:
+        x = x.unsqueeze(-1)  # [batch, dim, 1]
+    x = x.contiguous()
     batch, dim, seqlen = x.shape
     _, width = weight.shape
     assert 2 <= width <= 4, f"causal_conv1d triton fallback supports width 2..4, got {width}"
@@ -584,7 +590,7 @@ def causal_conv1d_decode(
         num_warps=4,
         num_stages=2,
     )
-    return out.squeeze(-1)
+    return out.squeeze(-1) if squeeze else out
 
 
 # ---------------------------------------------------------------------------

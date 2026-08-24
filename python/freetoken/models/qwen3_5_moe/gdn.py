@@ -172,16 +172,27 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        if batch.is_decode or getattr(batch, "is_verify", False):
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
-            mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
-            B = mixed.shape[0]
+            # MTP verify steps take this path too, with a fixed T tokens per request: the
+            # kernel is varlen (cu_seqlens from FLAMetadata) and loops T steps per
+            # sequence in-kernel; the conv update shifts the state by T. This replaces the
+            # chunk-prefill path for verification, whose per-layer host overhead dominated.
+            if batch.is_decode:
+                mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
+            else:
+                n_req = fla.cache_indices.shape[0]
+                t_per = total // n_req
+                x3 = conv_in.view(n_req, t_per, -1).transpose(1, 2)  # [B, conv_dim, T]
+                mixed = self._conv_decode(x3, fla.cache_indices, pool)  # [B, conv_dim, T]
+                mixed = mixed.transpose(1, 2).reshape(total, -1)
+            n_tok = mixed.shape[0]
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, B, self.num_v_heads, self.head_v_dim).to(dtype)
+            q = qf.reshape(1, n_tok, self.num_k_heads, self.head_k_dim).to(dtype)
+            k = kf.reshape(1, n_tok, self.num_k_heads, self.head_k_dim).to(dtype)
+            v = vf.reshape(1, n_tok, self.num_v_heads, self.head_v_dim).to(dtype)
             core_out = gdn_decode_fla(
                 q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
