@@ -19,7 +19,6 @@ flag replaces the env var when the serve path lands).
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,16 +26,13 @@ from freetoken.layers import BaseOP, GemmaRMSNorm, LinearReplicated, OPList
 from freetoken.layers.moe import MoELayer
 from freetoken.moe.fused import fused_topk
 from freetoken.utils import nvtx_annotate
+from freetoken.utils.mtp import mtp_enabled
 
 from .attention import Qwen3_5Attention
 from .moe import _SharedExpert
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
-
-
-def mtp_enabled() -> bool:
-    return os.environ.get("FREETOKEN_MTP", "0") == "1"
 
 
 class _BF16View:
@@ -147,17 +143,16 @@ class Qwen3_5MTPHead(BaseOP):
         self.norm = GemmaRMSNorm(h, eps=eps)
 
     def combine(self, token_embeds: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
-        """The pre-layer combiner. Order matches the checkpoint naming
-        (embedding half first); if measured draft acceptance comes out near zero
-        with correct weights, swapping the halves is the first thing to try."""
-        x = torch.cat(
-            [
-                self.pre_fc_norm_embedding.forward(token_embeds),
-                self.pre_fc_norm_hidden.forward(hidden),
-            ],
-            dim=-1,
-        )
-        return self.fc.forward(x)
+        """The pre-layer combiner. Default order: embedding half first (matches the
+        checkpoint naming). FREETOKEN_MTP_COMBINE=he swaps the halves — a debugging
+        knob for resolving the checkpoint's undocumented concat order empirically
+        (the wrong order shows up as near-zero draft acceptance)."""
+        import os
+
+        e = self.pre_fc_norm_embedding.forward(token_embeds)
+        h = self.pre_fc_norm_hidden.forward(hidden)
+        parts = [h, e] if os.environ.get("FREETOKEN_MTP_COMBINE") == "he" else [e, h]
+        return self.fc.forward(torch.cat(parts, dim=-1))
 
     def forward(self, token_embeds: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
         x = self.combine(token_embeds, hidden)

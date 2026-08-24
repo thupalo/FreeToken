@@ -41,10 +41,13 @@ class MHAKVCache(BaseKVCachePool):
             self._layer_map: list[int] | None = None
         else:
             num_storage_layers = len(layer_ids)
-            layer_map = [-1] * num_layers
+            # Map size covers ids past the decoder stack: auxiliary full-attention
+            # layers (the MTP draft head) carry global ids >= num_layers.
+            map_size = max(num_layers, max(layer_ids) + 1)
+            layer_map = [-1] * map_size
             for dense, global_id in enumerate(layer_ids):
-                if global_id < 0 or global_id >= num_layers:
-                    raise ValueError(f"KV layer id {global_id} outside [0, {num_layers})")
+                if global_id < 0:
+                    raise ValueError(f"KV layer id {global_id} outside [0, {map_size})")
                 layer_map[global_id] = dense
             self._layer_map = layer_map
         self._kv_buffer = torch.empty(

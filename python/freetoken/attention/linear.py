@@ -77,7 +77,14 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
 
-    track_dst, track_h_row, track_conv_src = _build_track_metadata(reqs, cu_host, device, pin)
+    # No ×CHUNK track snapshots during MTP verify steps: a rejected candidate would leave
+    # the snapshot polluted while its mamba_last_track_seqlen mark still says "valid", and
+    # a later donation would poison the prefix cache. Verify windows are 2 tokens, so the
+    # skipped coverage is negligible.
+    if getattr(batch, "is_verify", False):
+        track_dst = track_h_row = track_conv_src = None
+    else:
+        track_dst, track_h_row, track_conv_src = _build_track_metadata(reqs, cu_host, device, pin)
 
     return FLAMetadata(
         cu_seqlens=cu_host.to(device, non_blocking=True),

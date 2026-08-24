@@ -283,10 +283,22 @@ def _materialize_loaded_weight_state_dict(
     return state_dict
 
 
+class MtpStepOutput(NamedTuple):
+    """Per-step MTP data. Draft-only steps (prefill) carry just ``draft_gpu``;
+    verify steps carry the accept decision and both sampled rows."""
+
+    draft_gpu: torch.Tensor                  # [bs] int32 draft candidate per request
+    accept_gpu: torch.Tensor | None = None   # [bs] bool: staged candidate == row-0 sample
+    b0_gpu: torch.Tensor | None = None       # [bs] int32 row-0 samples (successor of input 0)
+    b1_gpu: torch.Tensor | None = None       # [bs] int32 row-1 samples (successor of candidate)
+    verify_cpu: torch.Tensor | None = None   # [bs, 3] int32 (b0, b1, accept) host copy
+
+
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    mtp: MtpStepOutput | None = None
 
 
 class Engine:
@@ -321,6 +333,9 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        # MTP draft head (FREETOKEN_MTP=1 + a checkpoint that ships one): drives the
+        # draft/verify serve path in forward_batch. None = plain decoding.
+        self.mtp_head = getattr(self.model, "mtp", None)
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -367,7 +382,11 @@ class Engine:
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
         self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        aligned_max_seq_len = _page_table_width(
+            # +2 columns under MTP: verify staging holds a candidate one position past
+            # max_device_len, and the token-pool write path uses column -1 as a dump.
+            self.max_seq_len + (2 if self.mtp_head is not None else 0), config.page_size
+        )
         self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request
             (config.max_running_req + 1, aligned_max_seq_len),
             dtype=torch.int32,
@@ -749,7 +768,11 @@ class Engine:
     def _refresh_seq_state(self, config) -> None:
         num_tokens = self.num_pages * config.page_size
         self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        aligned_max_seq_len = _page_table_width(
+            # +2 columns under MTP: verify staging holds a candidate one position past
+            # max_device_len, and the token-pool write path uses column -1 as a dump.
+            self.max_seq_len + (2 if self.mtp_head is not None else 0), config.page_size
+        )
         if aligned_max_seq_len != self.page_table.shape[1]:
             # max_seq_len changed (e.g. KV grew past the startup token budget); the page table
             # columns must track it or new requests would index out of bounds. The scheduler
@@ -889,7 +912,11 @@ class Engine:
             self.linear_state_pool.rebuild(num_mamba_slots + 1)
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        aligned_max_seq_len = _page_table_width(
+            # +2 columns under MTP: verify staging holds a candidate one position past
+            # max_device_len, and the token-pool write path uses column -1 as a dump.
+            self.max_seq_len + (2 if self.mtp_head is not None else 0), config.page_size
+        )
         # 4. Re-capture CUDA graphs against the new tensors (reset_capture above re-armed
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
         gc.collect()
@@ -910,11 +937,45 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        mtp_out: MtpStepOutput | None = None
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
+            if batch.is_verify:
+                # Speculative verification: 2 rows per request ([committed, candidate]),
+                # ALL logits kept (no last-token slice on non-prefill). Greedy-only.
+                # Counter updates (accept/reject) happen host-side at the drain; no
+                # complete_one here.
+                sampled = logits.argmax(dim=-1).to(torch.int32)
+                b0, b1 = sampled[0::2], sampled[1::2]
+                candidates = batch.input_ids[1::2].to(torch.int32)
+                accept = b0 == candidates
+                draft = self._mtp_draft(batch, b1)
+                verify_cpu = torch.stack([b0, b1, accept.to(torch.int32)], dim=1).to(
+                    "cpu", non_blocking=True
+                )
+                copy_done_event = torch.cuda.Event()
+                copy_done_event.record(self.stream)
+                return ForwardOutput(
+                    b0, verify_cpu, copy_done_event,
+                    MtpStepOutput(draft, accept, b0, b1, verify_cpu),
+                )
+            if self.mtp_head is not None and batch.is_prefill:
+                # Draft after prefill sampling, inside the batch ctx (the MTP layer's
+                # attention reuses this batch's metadata / paged-KV out_loc verbatim).
+                for req in batch.reqs:
+                    req.complete_one()
+                batch_logits = logits[: batch.size]
+                next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+                mtp_out = MtpStepOutput(self._mtp_draft(batch, next_tokens_gpu))
+                next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+                copy_done_event = torch.cuda.Event()
+                copy_done_event.record(self.stream)
+                return ForwardOutput(
+                    next_tokens_gpu, next_tokens_cpu, copy_done_event, mtp_out
+                )
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -929,6 +990,28 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _mtp_draft(self, batch: Batch, next_last_gpu: torch.Tensor) -> torch.Tensor:
+        """Run the MTP head over this batch's rows and return one greedy draft token per
+        request. MTP position i consumes (embed(token_{i+1}), hidden_i): the shifted-token
+        vector is the batch's own input ids rolled left, with each request's LAST row
+        replaced by the freshly sampled token. The roll leaks row 0 of the next request
+        into each request's last row, which is exactly the row overwritten -- so the leak
+        never survives. Must run inside ctx.forward_batch (attention metadata + out_loc).
+
+        Chunked-prefill caveat: on intermediate chunks the last row's "next token" (the
+        following chunk's first token) is unknown here, so one MTP KV row per chunk
+        boundary is built from a garbage token. This only dilutes draft acceptance
+        marginally; it cannot affect correctness (verification is exact)."""
+        model = self.model
+        hidden = model._mtp_hidden  # [rows, hidden], stashed by model.forward
+        last_idx = batch.attn_metadata.get_last_indices(batch.size)
+        shifted = torch.roll(batch.input_ids, -1)
+        shifted[last_idx] = next_last_gpu.to(shifted.dtype)
+        embeds = model.model.embed_tokens.forward(shifted)
+        mtp_hidden = self.mtp_head.forward(embeds, hidden)
+        draft_logits = model.lm_head.project(mtp_hidden[last_idx])
+        return draft_logits.argmax(dim=-1).to(torch.int32)
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

@@ -99,6 +99,12 @@ class ParallelLMHead(VocabParallelEmbedding):
             return super().state_dict(prefix=prefix, result=result)
         return {} if result is None else result
 
+    def project(self, x: torch.Tensor) -> torch.Tensor:
+        """Raw vocab projection with no batch-context slicing (MTP draft head; TP=1)."""
+        assert self.tp_size == 1, "MTP drafting is TP=1 only"
+        module = self.tied_embedding or self
+        return F.linear(x, module.weight, self.bias)
+
     @nvtx_annotate("LMHead")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()

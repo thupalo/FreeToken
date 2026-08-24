@@ -257,11 +257,14 @@ class CacheManager:
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
-            first_page = div_ceil(req.cached_len, self.page_size)
+            # paged_len: positions at/above cached_len that already hold slots (MTP verify
+            # repair re-runs the same window; re-allocating would leak the old slots).
+            first_page = div_ceil(max(req.cached_len, req.paged_len), self.page_size)
             last_page = div_ceil(req.device_len, self.page_size)
             if last_page > first_page:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
+            req.paged_len = max(req.paged_len, req.device_len)
         if needed_pages > 0:
             allocated = self._page_to_token(self._allocate(needed_pages))
             if self.swa_paged:
@@ -525,10 +528,13 @@ class CacheManager:
         slots = list(req.mamba_ping_pong) if req.mamba_ping_pong is not None else []
         if not keep_live and req.linear_slot_idx is not None:
             slots.append(req.linear_slot_idx)
+        if req.mtp_snapshot_slot is not None:
+            slots.append(req.mtp_snapshot_slot)
         if slots:
             self.linear_state_pool.free(slots)
         req.mamba_ping_pong = None
         req.linear_slot_idx = None
+        req.mtp_snapshot_slot = None
 
     def check_integrity(self) -> None:
         if self.is_hybrid:

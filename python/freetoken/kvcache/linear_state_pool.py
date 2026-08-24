@@ -216,12 +216,16 @@ def _linear_pool_num_slots(config) -> int:
     """LinearStatePool slot count. Hybrid-radix non-evictable peak is 4 slots per running request
     (1 live + 2 ping-pong + 1 committed snapshot locked through decode), plus a cross-request
     snapshot cache and a padding sink; naive GDN keeps the old (max_running_req + 1)."""
+    from freetoken.utils.mtp import mtp_enabled
+
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
     ratio = config.linear_state_cache_ratio
     n_cache = max(4, int(ratio * mr))
-    return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
+    # +mr under MTP: one rollback-snapshot slot per running request (lazily allocated).
+    mtp_extra = mr if mtp_enabled() else 0
+    return 4 * mr + n_cache + 1 + mtp_extra
 
 
 def _linear_pool_min_slots(config) -> int:

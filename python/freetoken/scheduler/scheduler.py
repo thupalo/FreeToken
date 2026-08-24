@@ -280,7 +280,10 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        # MTP speculative decoding forces the non-overlap loop: a verify step's inputs
+        # (accept decision, staged pair) come from the immediately preceding step, so
+        # there is no independent next batch to overlap with.
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self.engine.mtp_head is not None:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -300,7 +303,11 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch = last_data[0].batch
+        forward_output = last_data[1]
+        next_tokens_cpu = forward_output.next_tokens_cpu
+        mtp_out = forward_output.mtp
+        copy_done = forward_output.copy_done_event
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
@@ -331,42 +338,100 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
+                # ---- which tokens did this step emit? ----
+                if batch.is_verify:
+                    v = forward_output.mtp.verify_cpu[i]
+                    b0, b1, acc = int(v[0]), int(v[1]), int(v[2])
+                    if ENV.MTP_DEBUG:
+                        logger.info_rank0(
+                            f"MTPDBG uid={req.uid} C={req.cached_len} D={req.device_len} "
+                            f"b0={b0} b1={b1} acc={acc} known={req.mtp_candidate_known}"
+                        )
+                    if req.mtp_candidate_known and not acc:
+                        # A repair step re-runs [x, b0] from the restored GDN snapshot; its
+                        # row-0 output MUST reproduce b0. A mismatch means the rollback did
+                        # not restore the exact pre-step state — a correctness bug.
+                        logger.warning(
+                            f"MTP repair diverged (uid={req.uid}, C={req.cached_len}): "
+                            f"state restore is inconsistent"
+                        )
+                    # rolling acceptance telemetry (repair steps auto-accept; exclude them)
+                    if not req.mtp_candidate_known:
+                        self._mtp_steps = getattr(self, "_mtp_steps", 0) + 1
+                        self._mtp_accepts = getattr(self, "_mtp_accepts", 0) + int(acc)
+                        if self._mtp_steps % 100 == 0:
+                            logger.info_rank0(
+                                f"MTP acceptance: {self._mtp_accepts}/{self._mtp_steps} "
+                                f"({self._mtp_accepts / self._mtp_steps:.1%})"
+                            )
+                    if acc:
+                        # Repair steps (candidate KNOWN correct) already emitted the
+                        # row-0 token when it was first sampled; emit only row 1.
+                        emitted = [b1] if req.mtp_candidate_known else [b0, b1]
+                        req.mtp_candidate_known = False
+                        req.cached_len += 2
+                        req.device_len = req.cached_len + 2  # next staged pair
+                    else:
+                        # Reject: row 0's sample is the true token; the GDN state is
+                        # polluted by the bad candidate. The repair pair [committed, b0]
+                        # was staged on-GPU by _write_sampled_tokens; counters stay put
+                        # (same [C, C+2) window re-runs from the restored snapshot).
+                        emitted = [b0]
+                        req.mtp_candidate_known = True
+                        req.mtp_restore_pending = True
+                else:
+                    emitted = [int(next_tokens_cpu[i].item())]
+
+                finished = False
+                finish_reason = matched_stop = None
+                for next_token in emitted:
+                    req.append_host(torch.tensor([next_token], dtype=torch.int32))
+                    # EOS / stop-string -> "stop", output budget exhausted -> "length";
+                    # EOS and stop strings win over length.
+                    hit_length = not req.can_decode
+                    hit_eos = (
+                        not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                     )
-                )
+                    matched_stop = (
+                        self._match_stop_str(req)
+                        if not hit_eos and req.sampling_params.stop_strs
+                        else None
+                    )
+                    finished = hit_length or hit_eos or matched_stop is not None
+                    finish_reason = (
+                        ("stop" if (hit_eos or matched_stop is not None) else "length")
+                        if finished
+                        else None
+                    )
+                    if (
+                        next_token == self.toolcall_anchor_id
+                        and req.toolcall_anchor_len is None
+                        and not finished
+                    ):
+                        req.toolcall_anchor_len = req.input_ids.numel()
+                    reply.append(
+                        DetokenizeMsg(
+                            uid=req.uid,
+                            next_token=next_token,
+                            finished=finished,
+                            finish_reason=finish_reason,
+                            matched_stop=matched_stop,
+                            stop_strs=req.sampling_params.stop_strs or None,
+                        )
+                    )
+                    if finished:
+                        break
+
+                if (
+                    not finished
+                    and batch.is_prefill
+                    and mtp_out is not None
+                    and req.sampling_params.is_greedy
+                ):
+                    # Activate drafting: the engine staged this request's first draft at
+                    # device_len + 1; widen the device window to cover the pair.
+                    req.mtp_active = True
+                    req.device_len += 1
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -419,7 +484,7 @@ class Scheduler(SchedulerIOMixin):
         only a short suffix (bounded by the longest stop string's char length, so a stop of
         N chars spans at most N tokens) to keep the per-step cost small."""
         stop_strs = req.sampling_params.stop_strs
-        prompt_len = req.max_device_len - req.output_len
+        prompt_len = req.prompt_len
         if len(req.input_ids) <= prompt_len:
             return None
         max_chars = max(len(s) for s in stop_strs)
@@ -598,6 +663,14 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        # MTP verify staging allocates page slots past cached_len (up to paged_len); no
+        # cache free-path knows about them, so return them here before cache_req reads
+        # the row. Idempotent: paged_len is pulled back to cached_len after.
+        if req.paged_len > req.cached_len:
+            staged = self.engine.page_table[req.table_idx, req.cached_len : req.paged_len]
+            if staged.numel():
+                self.cache_manager._free(staged)
+            req.paged_len = req.cached_len
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -833,9 +906,44 @@ class Scheduler(SchedulerIOMixin):
         )
         if batch is None:
             return None
+        if batch.is_decode and self.engine.mtp_head is not None:
+            batch = self._maybe_verify_batch(batch)
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    def _maybe_verify_batch(self, batch: Batch) -> Batch:
+        """Turn a decode batch into an MTP verify batch (extend_len 2: committed token +
+        staged candidate) when every request is drafting. Mixed batches: requests with a
+        clean staged state are demoted to plain decode (candidate dropped, stays demoted);
+        requests mid-repair (restore pending / known candidate) cannot be demoted -- their
+        emitted-token bookkeeping depends on the repair step -- so they form a verify batch
+        alone and the plain requests wait one iteration."""
+        if self.cache_manager.is_hybrid:
+            # Lazy GDN snapshot-slot allocation (rollback target for rejected drafts).
+            # Sized into the pool (+1 slot per running request); a transient shortage
+            # demotes the request to plain decode rather than stalling.
+            pool = self.cache_manager.linear_state_pool
+            for r in batch.reqs:
+                if r.mtp_active and r.mtp_snapshot_slot is None:
+                    if pool.num_free_slots < 1:
+                        self.cache_manager.ensure_mamba_slots(1)
+                    if pool.num_free_slots < 1:
+                        r.mtp_active = False
+                        r.device_len -= 1
+                    else:
+                        r.mtp_snapshot_slot = pool.alloc(1)[0]
+        active = [r for r in batch.reqs if r.mtp_active]
+        if len(active) == len(batch.reqs):
+            batch.phase = "verify"
+            return batch
+        dirty = [r for r in active if r.mtp_restore_pending or r.mtp_candidate_known]
+        if dirty:
+            return Batch(reqs=sorted(dirty, key=lambda r: r.uid), phase="verify")
+        for r in active:  # demote: drop the staged candidate slot
+            r.mtp_active = False
+            r.device_len -= 1
+        return batch
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.
@@ -865,10 +973,56 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+        if batch.is_verify:
+            self._mtp_pre_verify(batch)
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        self._write_sampled_tokens(batch, forward_output, output_mapping)
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+    def _mtp_pre_verify(self, batch: Batch) -> None:
+        """GDN state snapshot/restore around verify steps, on the engine stream BEFORE the
+        step's kernels (same ordering argument as snapshot_toolcall_anchor). Restore first:
+        a rejected step left the live state polluted by the bad candidate, and the repair
+        step must re-run from the pre-step state. Then snapshot the (possibly restored)
+        live state so THIS step can be rolled back in turn."""
+        if not self.cache_manager.is_hybrid:
+            return
+        pool = self.engine.linear_state_pool
+        for r in batch.reqs:
+            if r.mtp_snapshot_slot is None:
+                continue
+            if r.mtp_restore_pending:
+                pool.copy_from(r.mtp_snapshot_slot, r.linear_slot_idx)
+                r.mtp_restore_pending = False
+            pool.copy_from(r.linear_slot_idx, r.mtp_snapshot_slot)
+
+    def _write_sampled_tokens(
+        self, batch: Batch, forward_output: ForwardOutput, output_mapping: Indice2D
+    ) -> None:
+        """Stage this step's outputs into the GPU token pool as the next step's inputs."""
+        mtp = forward_output.mtp
+        if batch.is_verify:
+            assert mtp is not None and mtp.accept_gpu is not None
+            ti, pos = output_mapping  # pos = device_len at prepare time = C+2
+            # Accept: next pair is [b1 @ C+2, draft @ C+3]. Reject: repair pair is the
+            # untouched committed token @ C plus the KNOWN-correct b0 replacing the bad
+            # candidate @ C+1; the draft is dumped into column -1 (write-tuple precedent
+            # for dead writes).
+            pos_a = torch.where(mtp.accept_gpu, pos, pos - 1)
+            val_a = torch.where(mtp.accept_gpu, mtp.b1_gpu, mtp.b0_gpu)
+            pos_b = torch.where(mtp.accept_gpu, pos + 1, torch.full_like(pos, -1))
+            self.token_pool[ti, pos_a] = val_a
+            self.token_pool[ti, pos_b] = mtp.draft_gpu
+            return
+        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if mtp is not None and batch.is_prefill:
+            # Stage the first draft right after the sampled token (device_len + 1 at
+            # prepare time); the drain bumps device_len to cover the pair. Keep the -1
+            # dead-write sentinel dead (ChunkedReq rows): -1 + 1 would hit column 0.
+            ti, pos = output_mapping
+            draft_pos = torch.where(pos >= 0, pos + 1, pos)
+            self.token_pool[ti, draft_pos] = mtp.draft_gpu
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

@@ -27,7 +27,9 @@ class DecodeManager:
     @property
     def inflight_tokens(self) -> int:
         tokens_reserved = (self.page_size - 1) * len(self.running_reqs)  # 1 page reserved
-        return sum(req.remain_len for req in self.running_reqs) + tokens_reserved
+        # max(0, ...): MTP staging inflates device_len past max_device_len by up to 2
+        # on the final tokens, which would otherwise subtract from the budget.
+        return sum(max(0, req.remain_len) for req in self.running_reqs) + tokens_reserved
 
     def schedule_next_batch(self) -> Batch | None:
         if not self.runnable:

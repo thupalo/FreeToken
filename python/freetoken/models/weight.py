@@ -240,10 +240,23 @@ def load_weight(
         # model never builds the tower, so replaying those tensors would trip load_state_dict's
         # strict unexpected-key check. Skip them here to match the model the engine built.
         skip_vision = not vision_load_enabled()
+        saw_mtp = False
         for name, tensor in iter_ftw_weights(model_path):
             if skip_vision and name.startswith(VISION_KEY_PREFIXES):
                 continue
+            saw_mtp = saw_mtp or name.startswith("mtp.")
             yield name, tensor
+        from freetoken.utils.mtp import mtp_enabled
+
+        if mtp_enabled() and not saw_mtp:
+            # The strict load will fail on the missing mtp.* buffers; say why first.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "FREETOKEN_MTP=1 but this FTW checkpoint carries no mtp.* tensors -- it "
+                "was converted without MTP. Delete the FTW copy (or point --model at the "
+                "original HF checkpoint) so conversion re-runs with the MTP head included."
+            )
         return
 
     _config, spec = _spec_for_model_path(model_path)

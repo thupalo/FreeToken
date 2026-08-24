@@ -131,21 +131,31 @@ def _load_maybe_quantized(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
     return tensor
 
 
-# Norms of the MTP head that live outside the layer-suffix scheme; Gemma-style
-# (1+weight) like every other Qwen3.5 norm (the layer norms inside mtp.layers.N
-# already match _GEMMA_NORM_SUFFIXES by suffix).
-_MTP_GEMMA_EXACT = (
-    "mtp.norm.weight",
-    "mtp.pre_fc_norm_embedding.weight",
-    "mtp.pre_fc_norm_hidden.weight",
-)
+# Norms of the MTP head that live outside the layer-suffix scheme; assumed
+# Gemma-style (1+weight) like every other Qwen3.5 norm (the layer norms inside
+# mtp.layers.N already match _GEMMA_NORM_SUFFIXES by suffix).
+# FREETOKEN_MTP_PLAIN_NORMS=1 loads them WITHOUT the +1 bake — a debugging knob
+# for resolving the head's undocumented norm style (wrong choice = ~0% acceptance).
+def _mtp_gemma_exact() -> tuple[str, ...]:
+    import os
+
+    if os.environ.get("FREETOKEN_MTP_PLAIN_NORMS") == "1":
+        return ()
+    return (
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    )
+
+
+_MTP_GEMMA_EXACT = ()  # placeholder; _is_gemma_norm consults _mtp_gemma_exact()
 
 
 def _mtp_enabled() -> bool:
-    """Load the checkpoint's MTP draft head (kept in sync with models.qwen3_5_moe.mtp)."""
-    import os
+    """Load the checkpoint's MTP draft head (single switch: utils.mtp)."""
+    from freetoken.utils.mtp import mtp_enabled
 
-    return os.environ.get("FREETOKEN_MTP", "0") == "1"
+    return mtp_enabled()
 
 
 def _rename(raw_name: str) -> str | None:
@@ -172,7 +182,7 @@ def _rename(raw_name: str) -> str | None:
 def _is_gemma_norm(name: str) -> bool:
     return (
         name == "model.norm.weight"
-        or name in _MTP_GEMMA_EXACT
+        or name in _mtp_gemma_exact()
         or name.endswith(_GEMMA_NORM_SUFFIXES)
     )
 

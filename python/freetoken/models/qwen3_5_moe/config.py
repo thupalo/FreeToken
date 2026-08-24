@@ -196,6 +196,17 @@ def parse_config(hf_config: Any) -> ModelConfig:
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
 
+    # MTP draft head (FREETOKEN_MTP=1): its decoder layer(s) are full-attention with global
+    # layer ids num_layers..num_layers+k-1. Registering them in the full-attention group
+    # gives them paged-KV slabs (MHAKVCache allocates one per group layer) and makes
+    # is_linear_layer() resolve for them.
+    from freetoken.utils.mtp import mtp_enabled as _mtp_on
+
+    mtp_layers = int(getattr(text, "mtp_num_hidden_layers", 0) or 0)
+    if mtp_layers > 0 and _mtp_on():
+        n = text.num_hidden_layers
+        full_ids = full_ids + tuple(range(n, n + mtp_layers))
+
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,

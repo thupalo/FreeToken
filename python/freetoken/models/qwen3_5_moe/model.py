@@ -119,6 +119,10 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
+        if hasattr(self, "mtp"):
+            # Pre-lm_head hidden states of ALL tokens, consumed by the engine's MTP
+            # draft pass right after sampling (underscore attr: not in the state dict).
+            self._mtp_hidden = output
         return self.lm_head.forward(output)
 
 

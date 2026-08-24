@@ -65,9 +65,28 @@ class Req:
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
 
+    # --- MTP speculative decoding (FREETOKEN_MTP=1); all inert otherwise. ---
+    # Drafting/verification enabled for this request (greedy-only in this milestone). Once a
+    # request is demoted to plain decode (mixed batch), it stays demoted until finish.
+    mtp_active: bool = False
+    # GDN state snapshot slot: the live state is copied here before every verify step so a
+    # rejected draft can roll the recurrent/conv state back (LinearStatePool slot id).
+    mtp_snapshot_slot: int | None = None
+    # The staged candidate token (at position device_len-1) is KNOWN-correct (repair step
+    # after a rejection): its row-0 token was already emitted, so the drain emits only row 1.
+    mtp_candidate_known: bool = False
+    # A rejection happened last step: restore the GDN snapshot before the next forward.
+    mtp_restore_pending: bool = False
+    # High-water mark of page-table positions already allocated for this request. Verify
+    # repair steps re-run the same [cached_len, device_len) window; without this watermark
+    # allocate_paged would allocate (and leak) fresh slots for positions that already have
+    # them. 0 = nothing beyond cached_len (plain requests never read it).
+    paged_len: int = 0
+
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
         self.device_len = len(self.input_ids)
+        self.prompt_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
         self._alloc_ids_buf()
@@ -97,7 +116,17 @@ class Req:
         self.input_ids = self._ids_buf[:m]
 
     @property
+    def gen_len(self) -> int:
+        """Tokens emitted so far (host-side truth; device_len over-counts under MTP
+        staging, which keeps a not-yet-verified candidate beyond the committed length)."""
+        return self.input_ids.numel() - self.prompt_len
+
+    @property
     def can_decode(self) -> bool:
+        if self.mtp_active:
+            # device_len includes the staged draft slot, so remain_len under-counts by
+            # up to 2; the emitted-token count is the real budget.
+            return self.gen_len < self.output_len
         return self.remain_len > 0
 
     def __repr__(self) -> str:
@@ -112,7 +141,13 @@ class Req:
 @dataclass
 class Batch:
     reqs: List[Req]
-    phase: Literal["prefill", "decode"]
+    # "verify" = MTP speculative verification: a multi-token decode step (extend_len 2:
+    # committed token + draft candidate). Deliberately neither prefill nor decode, so the
+    # phase-consulting branches fall where verification needs them: attention takes the
+    # multi-token (prefill-wrapper) path, GDN takes the chunk path with initial states,
+    # the LM head keeps ALL rows (no last-token slice), MoE offload stays on the decode
+    # (miss-based) path, and CUDA-graph replay is bypassed.
+    phase: Literal["prefill", "decode", "verify"]
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
@@ -154,6 +189,10 @@ class Batch:
     @property
     def is_decode(self) -> bool:
         return self.phase == "decode"
+
+    @property
+    def is_verify(self) -> bool:
+        return self.phase == "verify"
 
     @property
     def size(self) -> int:
