@@ -92,8 +92,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --extra-index-url https://flashinfer.ai/whl/cu130 \
         "${RT_WHL}[fi]" flashinfer-cubin flashinfer-jit-cache "${KC_WHL}"
 
+# XDG_CACHE_HOME inside the /root/.freetoken volume: `ft bench bw` writes its
+# hardware profile (benchbw.json) under $XDG_CACHE_HOME/freetoken, and the
+# engine reads it from the same place -- without this the profile dies with
+# the container and --moe-backend auto re-runs unprofiled every start.
 ENV PATH="/opt/freetoken/bin:${PATH}" \
-    CUDA_HOME=/usr/local/cuda
+    CUDA_HOME=/usr/local/cuda \
+    XDG_CACHE_HOME=/root/.freetoken/cache
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
