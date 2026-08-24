@@ -155,7 +155,10 @@ class GraphRunner:
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
-        self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
+        capture_sizes = set(self.graph_bs_list)
+        if self.verify_tokens > 1:  # verify graphs need decode wrappers for bs*T rows
+            capture_sizes |= {bs * self.verify_tokens for bs in self.graph_bs_list}
+        self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=sorted(capture_sizes))
 
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()

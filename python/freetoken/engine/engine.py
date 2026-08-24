@@ -288,14 +288,15 @@ def _materialize_loaded_weight_state_dict(
 
 
 class MtpStepOutput(NamedTuple):
-    """Per-step MTP data. Draft-only steps (prefill) carry just ``draft_gpu``;
-    verify steps carry the accept decision and both sampled rows."""
+    """Per-step MTP data. Draft-only steps (prefill) carry just ``draft_gpu``; verify
+    steps (T rows per request = 1 committed + k candidates) carry the greedy samples of
+    every row, the accepted-draft count (level) and the per-row MTP drafts."""
 
-    draft_gpu: torch.Tensor                  # [bs] int32 draft candidate per request
-    accept_gpu: torch.Tensor | None = None   # [bs] bool: staged candidate == row-0 sample
-    b0_gpu: torch.Tensor | None = None       # [bs] int32 row-0 samples (successor of input 0)
-    b1_gpu: torch.Tensor | None = None       # [bs] int32 row-1 samples (successor of candidate)
-    verify_cpu: torch.Tensor | None = None   # [bs, 3] int32 (b0, b1, accept) host copy
+    draft_gpu: torch.Tensor                  # [bs] int32 draft after the last row (prefill)
+    b_gpu: torch.Tensor | None = None        # [bs, T] int32 greedy sample of each row
+    level_gpu: torch.Tensor | None = None    # [bs] int32 number of accepted candidates (0..k)
+    drafts_gpu: torch.Tensor | None = None   # [bs, T] int32 MTP draft after row j's TRUE token
+    verify_cpu: torch.Tensor | None = None   # [bs, T+1] int32 (b_0..b_{T-1}, level) host copy
 
 
 class ForwardOutput(NamedTuple):
@@ -340,6 +341,9 @@ class Engine:
         # MTP draft head (FREETOKEN_MTP=1 + a checkpoint that ships one): drives the
         # draft/verify serve path in forward_batch. None = plain decoding.
         self.mtp_head = getattr(self.model, "mtp", None)
+        # k drafts per step -> verify rows T = k + 1 (1 committed token + k candidates).
+        self.mtp_drafts = int(os.environ.get("FREETOKEN_MTP_DRAFTS", "1")) if self.mtp_head else 0
+        self.mtp_T = self.mtp_drafts + 1
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -440,7 +444,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
-            verify_tokens=2 if self.mtp_head is not None else 0,
+            verify_tokens=self.mtp_T if self.mtp_head is not None else 0,
             verify_post=self._verify_compute if self.mtp_head is not None else None,
         )
         if config.attention_backend.split(",")[0] == "triton":
@@ -939,7 +943,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
-            verify_tokens=2 if self.mtp_head is not None else 0,
+            verify_tokens=self.mtp_T if self.mtp_head is not None else 0,
             verify_post=self._verify_compute if self.mtp_head is not None else None,
         )
 
@@ -998,23 +1002,23 @@ class Engine:
                 if profile:
                     ev[1].record(self.stream)
                 if getattr(batch, "_verify_graph_out", None) is not None:
-                    # Replayed graph: argmax/accept/draft were captured with the forward
+                    # Replayed graph: argmax/accept/drafts were captured with the forward
                     # and landed in graph-owned buffers.
-                    b0, b1, accept, draft = batch._verify_graph_out
+                    b, level, drafts = batch._verify_graph_out
                 else:
-                    b0, b1, accept, draft = self._verify_compute(batch, logits)
+                    b, level, drafts = self._verify_compute(batch, logits)
                 if profile:
                     ev[2].record(self.stream)
                     ev[3].record(self.stream)
                     self._profile_verify(ev, wall0)
-                verify_cpu = torch.stack([b0, b1, accept.to(torch.int32)], dim=1).to(
+                verify_cpu = torch.cat([b, level.unsqueeze(1)], dim=1).to(
                     "cpu", non_blocking=True
                 )
                 copy_done_event = torch.cuda.Event()
                 copy_done_event.record(self.stream)
                 return ForwardOutput(
-                    b0, verify_cpu, copy_done_event,
-                    MtpStepOutput(draft, accept, b0, b1, verify_cpu),
+                    b[:, 0], verify_cpu, copy_done_event,
+                    MtpStepOutput(drafts[:, -1], b, level, drafts, verify_cpu),
                 )
             if self.mtp_head is not None and batch.is_prefill:
                 # Draft after prefill sampling, inside the batch ctx (the MTP layer's
@@ -1046,16 +1050,37 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def _verify_compute(self, batch: Batch, logits: torch.Tensor):
-        """Verify-step post-processing on the target logits: greedy samples of both rows,
-        the accept decision (row-0 sample == staged candidate) and the next MTP draft.
-        Pure tensor ops with static shapes -- captured into the verify CUDA graph."""
-        rows = 2 * batch.size  # padded graph batches carry extra dummy rows
+        """Verify-step post-processing on the target logits (T rows per request):
+        greedy sample b_j of every row, the accepted-draft count
+        level = number of leading candidates j with cand_j == b_{j-1}, and the MTP
+        drafts: the head is fed each row's TRUE successor b_j (not the staged
+        candidate), so drafts[:, j] is a valid draft after b_j for EVERY possible
+        last-valid row -- the full-accept draft (j = T-1) and the repair draft
+        (j = level) come from one pass. Pure tensor ops, static shapes: captured
+        into the verify CUDA graph."""
+        T = self.mtp_T
+        bs = batch.size
+        rows = T * bs  # padded graph batches carry extra dummy rows
         sampled = logits[:rows].argmax(dim=-1).to(torch.int32)
-        b0, b1 = sampled[0::2], sampled[1::2]
-        candidates = batch.input_ids[:rows][1::2].to(torch.int32)
-        accept = b0 == candidates
-        draft = self._mtp_draft(batch, b1)
-        return b0, b1, accept, draft
+        b = sampled.view(bs, T)
+        cand = batch.input_ids[:rows].view(bs, T)[:, 1:].to(torch.int32)   # [bs, k]
+        acc = (b[:, :-1] == cand).to(torch.int32)                          # [bs, k]
+        level = torch.cumprod(acc, dim=1).sum(dim=1).to(torch.int32)       # leading accepts
+        drafts = self._mtp_draft_rows(batch, sampled)                       # [rows] -> [bs, T]
+        return b, level, drafts.view(bs, T)
+
+    def _mtp_draft_rows(self, batch: Batch, next_tokens: torch.Tensor) -> torch.Tensor:
+        """MTP pass over every row of a verify batch with row j's shifted token = the
+        row's own greedy sample; returns one draft per row ([rows] int32)."""
+        model = self.model
+        hidden = model._mtp_hidden
+        rows = next_tokens.shape[0]
+        shifted = next_tokens.to(batch.input_ids.dtype)
+        if hidden.shape[0] > rows:  # padded graph rows: keep the full row count for the pass
+            shifted = torch.cat([shifted, batch.input_ids[rows:].to(shifted.dtype)])
+        embeds = model.model.embed_tokens.forward(shifted)
+        mtp_hidden = self.mtp_head.forward(embeds, hidden)
+        return model.lm_head.project(mtp_hidden[:rows]).argmax(dim=-1).to(torch.int32)
 
     def _mtp_draft(self, batch: Batch, next_last_gpu: torch.Tensor) -> torch.Tensor:
         """Run the MTP head over this batch's rows and return one greedy draft token per

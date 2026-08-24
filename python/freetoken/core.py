@@ -72,9 +72,10 @@ class Req:
     # GDN state snapshot slot: the live state is copied here before every verify step so a
     # rejected draft can roll the recurrent/conv state back (LinearStatePool slot id).
     mtp_snapshot_slot: int | None = None
-    # The staged candidate token (at position device_len-1) is KNOWN-correct (repair step
-    # after a rejection): its row-0 token was already emitted, so the drain emits only row 1.
-    mtp_candidate_known: bool = False
+    # Number of leading candidate rows (1..known) holding KNOWN-correct tokens (a repair
+    # window after a partial accept); their outputs were already emitted when first
+    # sampled, so the drain skips them. 0 = a fully speculative window.
+    mtp_candidate_known: int = 0
     # A rejection happened last step: restore the GDN snapshot before the next forward.
     mtp_restore_pending: bool = False
     # High-water mark of page-table positions already allocated for this request. Verify

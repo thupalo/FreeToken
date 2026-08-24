@@ -340,44 +340,46 @@ class Scheduler(SchedulerIOMixin):
                     continue
                 # ---- which tokens did this step emit? ----
                 if batch.is_verify:
-                    v = forward_output.mtp.verify_cpu[i]
-                    b0, b1, acc = int(v[0]), int(v[1]), int(v[2])
+                    T = self.engine.mtp_T
+                    k = T - 1
+                    v = forward_output.mtp.verify_cpu[i].tolist()
+                    bt, L = v[:T], int(v[T])
+                    known = int(req.mtp_candidate_known)  # rows 1..known hold KNOWN tokens
                     if ENV.MTP_DEBUG:
                         logger.info_rank0(
                             f"MTPDBG uid={req.uid} C={req.cached_len} D={req.device_len} "
-                            f"b0={b0} b1={b1} acc={acc} known={req.mtp_candidate_known}"
+                            f"b={bt} level={L} known={known}"
                         )
-                    if req.mtp_candidate_known and not acc:
-                        # A repair step re-runs [x, b0] from the restored GDN snapshot; its
-                        # row-0 output MUST reproduce b0. A mismatch means the rollback did
-                        # not restore the exact pre-step state — a correctness bug.
+                    if known and L < known:
+                        # Repair rows re-run from the restored GDN snapshot and MUST
+                        # reproduce their known tokens; anything else is a rollback bug.
                         logger.warning(
-                            f"MTP repair diverged (uid={req.uid}, C={req.cached_len}): "
-                            f"state restore is inconsistent"
+                            f"MTP repair diverged (uid={req.uid}, C={req.cached_len}, "
+                            f"level={L} < known={known}): state restore is inconsistent"
                         )
-                    # rolling acceptance telemetry (repair steps auto-accept; exclude them)
-                    if not req.mtp_candidate_known:
-                        self._mtp_steps = getattr(self, "_mtp_steps", 0) + 1
-                        self._mtp_accepts = getattr(self, "_mtp_accepts", 0) + int(acc)
-                        if self._mtp_steps % 100 == 0:
+                    # rolling acceptance telemetry over the speculative (non-known) rows
+                    spec = k - known
+                    if spec > 0:
+                        self._mtp_steps = getattr(self, "_mtp_steps", 0) + spec
+                        self._mtp_accepts = getattr(self, "_mtp_accepts", 0) + max(0, L - known)
+                        if self._mtp_steps // spec % 100 == 0:
                             logger.info_rank0(
                                 f"MTP acceptance: {self._mtp_accepts}/{self._mtp_steps} "
-                                f"({self._mtp_accepts / self._mtp_steps:.1%})"
+                                f"({self._mtp_accepts / max(1, self._mtp_steps):.1%})"
                             )
-                    if acc:
-                        # Repair steps (candidate KNOWN correct) already emitted the
-                        # row-0 token when it was first sampled; emit only row 1.
-                        emitted = [b1] if req.mtp_candidate_known else [b0, b1]
-                        req.mtp_candidate_known = False
-                        req.cached_len += 2
-                        req.device_len = req.cached_len + 2  # next staged pair
+                    # Rows 0..L produced true tokens b_0..b_L; those with index < known were
+                    # already emitted when first sampled.
+                    emitted = [bt[j] for j in range(L + 1) if j >= known]
+                    if L == k:
+                        # Full accept: all T rows valid; next window staged on GPU.
+                        req.mtp_candidate_known = 0
+                        req.cached_len += T
+                        req.device_len = req.cached_len + T
                     else:
-                        # Reject: row 0's sample is the true token; the GDN state is
-                        # polluted by the bad candidate. The repair pair [committed, b0]
-                        # was staged on-GPU by _write_sampled_tokens; counters stay put
-                        # (same [C, C+2) window re-runs from the restored snapshot).
-                        emitted = [b0]
-                        req.mtp_candidate_known = True
+                        # Partial: the GDN state is polluted past row L. Rows 1..L+1 now
+                        # hold known tokens (staged on GPU), the rest a real draft/dump;
+                        # counters stay put and the window re-runs from the snapshot.
+                        req.mtp_candidate_known = L + 1
                         req.mtp_restore_pending = True
                 else:
                     emitted = [int(next_tokens_cpu[i].item())]
@@ -431,7 +433,7 @@ class Scheduler(SchedulerIOMixin):
                     # Activate drafting: the engine staged this request's first draft at
                     # device_len + 1; widen the device window to cover the pair.
                     req.mtp_active = True
-                    req.device_len += 1
+                    req.device_len += self.engine.mtp_T - 1
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -932,7 +934,7 @@ class Scheduler(SchedulerIOMixin):
                         self.cache_manager.ensure_mamba_slots(1)
                     if pool.num_free_slots < 1:
                         r.mtp_active = False
-                        r.device_len -= 1
+                        r.device_len -= self.engine.mtp_T - 1
                     else:
                         r.mtp_snapshot_slot = pool.alloc(1)[0]
         active = [r for r in batch.reqs if r.mtp_active]
@@ -942,9 +944,9 @@ class Scheduler(SchedulerIOMixin):
         dirty = [r for r in active if r.mtp_restore_pending or r.mtp_candidate_known]
         if dirty:
             return Batch(reqs=sorted(dirty, key=lambda r: r.uid), phase="verify")
-        for r in active:  # demote: drop the staged candidate slot
+        for r in active:  # demote: drop the staged candidate slots
             r.mtp_active = False
-            r.device_len -= 1
+            r.device_len -= self.engine.mtp_T - 1
         return batch
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
@@ -1005,17 +1007,31 @@ class Scheduler(SchedulerIOMixin):
         """Stage this step's outputs into the GPU token pool as the next step's inputs."""
         mtp = forward_output.mtp
         if batch.is_verify:
-            assert mtp is not None and mtp.accept_gpu is not None
-            ti, pos = output_mapping  # pos = device_len at prepare time = C+2
-            # Accept: next pair is [b1 @ C+2, draft @ C+3]. Reject: repair pair is the
-            # untouched committed token @ C plus the KNOWN-correct b0 replacing the bad
-            # candidate @ C+1; the draft is dumped into column -1 (write-tuple precedent
-            # for dead writes).
-            pos_a = torch.where(mtp.accept_gpu, pos, pos - 1)
-            val_a = torch.where(mtp.accept_gpu, mtp.b1_gpu, mtp.b0_gpu)
-            pos_b = torch.where(mtp.accept_gpu, pos + 1, torch.full_like(pos, -1))
-            self.token_pool[ti, pos_a] = val_a
-            self.token_pool[ti, pos_b] = mtp.draft_gpu
+            assert mtp is not None and mtp.level_gpu is not None
+            ti, pos = output_mapping  # pos = device_len at prepare time = C+T
+            T = self.engine.mtp_T
+            k = T - 1
+            b, L, drafts = mtp.b_gpu, mtp.level_gpu, mtp.drafts_gpu
+            dump = torch.full_like(pos, -1)
+            full = L == k
+            # Candidate rows C+1 .. C+T-1 (the committed token at C is never touched):
+            #   row j (1..T-1) <- b_{j-1} if j-1 <= L  (true tokens: accepted candidates
+            #                                and the first correction; equal values for
+            #                                accepted rows, so the write is harmless)
+            #                  <- drafts[:, L] if j-1 == L+1 (real draft after b_L)
+            #                  <- dump otherwise.
+            # On a full accept those rows already hold their (accepted) values.
+            for j in range(1, T):
+                jm = j - 1
+                val = torch.where(
+                    jm <= L, b[:, min(jm, k)],
+                    torch.where(jm == L + 1, drafts.gather(1, L.clamp(max=T - 1).unsqueeze(1).long()).squeeze(1), b[:, 0]),
+                )
+                pj = torch.where(full, dump, pos - T + j)
+                self.token_pool[ti, pj] = val
+            # Full accept: next window [b_{T-1} @ C+T, d1 @ C+T+1, ...]; partial: dumped.
+            self.token_pool[ti, torch.where(full, pos, dump)] = b[:, T - 1]
+            self.token_pool[ti, torch.where(full, pos + 1, dump)] = drafts[:, T - 1]
             return
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         if mtp is not None and batch.is_prefill:
