@@ -249,6 +249,14 @@ def _scaled_mm(
     )
 
 
+# Experiment knob (GB10): torch._scaled_mm (cuBLASLt FP8 GEMM) at M=1/2 profiled at ~6.5 ms
+# per decode step -- 43% of the step. FREETOKEN_FP8_W8A16=1 routes every M through the
+# triton W8A16 GEMV/GEMM instead, to A/B the two on this GPU.
+import os as _os
+
+_FORCE_W8A16 = _os.environ.get("FREETOKEN_FP8_W8A16", "0") == "1"
+
+
 def fp8_pertensor_linear(
     x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
@@ -269,7 +277,7 @@ def fp8_pertensor_linear(
     if _USE_REF:  # numeric-reference fallback (debug / A-B)
         w = weight.to(x.dtype) * weight_scale.to(x.dtype)[:, None]
         out = (x.reshape(-1, K) @ w.t()).reshape(*lead, N)
-    elif input_scale is not None and e4m3_native():
+    elif input_scale is not None and e4m3_native() and not _FORCE_W8A16:
         out = _scaled_mm(
             x.reshape(-1, K), weight, weight_scale, input_scale, uniform_scale, x.dtype,
         ).reshape(*lead, N)

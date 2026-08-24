@@ -441,6 +441,7 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             verify_tokens=2 if self.mtp_head is not None else 0,
+            verify_post=self._verify_compute if self.mtp_head is not None else None,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -939,6 +940,7 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             verify_tokens=2 if self.mtp_head is not None else 0,
+            verify_post=self._verify_compute if self.mtp_head is not None else None,
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
@@ -995,15 +997,14 @@ class Engine:
                 # complete_one here.
                 if profile:
                     ev[1].record(self.stream)
-                rows = 2 * batch.size  # padded graph batches carry extra dummy rows
-                sampled = logits[:rows].argmax(dim=-1).to(torch.int32)
-                b0, b1 = sampled[0::2], sampled[1::2]
-                candidates = batch.input_ids[:rows][1::2].to(torch.int32)
-                accept = b0 == candidates
+                if getattr(batch, "_verify_graph_out", None) is not None:
+                    # Replayed graph: argmax/accept/draft were captured with the forward
+                    # and landed in graph-owned buffers.
+                    b0, b1, accept, draft = batch._verify_graph_out
+                else:
+                    b0, b1, accept, draft = self._verify_compute(batch, logits)
                 if profile:
                     ev[2].record(self.stream)
-                draft = self._mtp_draft(batch, b1)
-                if profile:
                     ev[3].record(self.stream)
                     self._profile_verify(ev, wall0)
                 verify_cpu = torch.stack([b0, b1, accept.to(torch.int32)], dim=1).to(
@@ -1043,6 +1044,18 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _verify_compute(self, batch: Batch, logits: torch.Tensor):
+        """Verify-step post-processing on the target logits: greedy samples of both rows,
+        the accept decision (row-0 sample == staged candidate) and the next MTP draft.
+        Pure tensor ops with static shapes -- captured into the verify CUDA graph."""
+        rows = 2 * batch.size  # padded graph batches carry extra dummy rows
+        sampled = logits[:rows].argmax(dim=-1).to(torch.int32)
+        b0, b1 = sampled[0::2], sampled[1::2]
+        candidates = batch.input_ids[:rows][1::2].to(torch.int32)
+        accept = b0 == candidates
+        draft = self._mtp_draft(batch, b1)
+        return b0, b1, accept, draft
 
     def _mtp_draft(self, batch: Batch, next_last_gpu: torch.Tensor) -> torch.Tensor:
         """Run the MTP head over this batch's rows and return one greedy draft token per

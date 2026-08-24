@@ -118,10 +118,14 @@ class GraphRunner:
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
         verify_tokens: int = 0,
+        verify_post=None,
     ) -> None:
         # MTP verify steps (T tokens per request) get their own graph family, keyed
-        # ("verify", bs). 0 = no verify graphs.
+        # ("verify", bs). 0 = no verify graphs. verify_post(batch, logits) -> tensors is
+        # captured right after the forward so replay yields the sampled/accept/draft
+        # results without any eager work.
         self.verify_tokens = verify_tokens
+        self.verify_post = verify_post
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
@@ -221,6 +225,7 @@ class GraphRunner:
             max(self.verify_bs_list), vocab_size, self.device, tokens_per_req=T
         )
         self.verify_hidden: Dict[int, torch.Tensor | None] = {}
+        self.verify_outs: Dict[int, tuple | None] = {}
         self._model = model
         # A verify dummy: same slots as the decode dummy, extend_len == T.
         vdummy = copy.copy(self.dummy_req)
@@ -239,13 +244,20 @@ class GraphRunner:
             rows = bs * T
             with get_global_ctx().forward_batch(batch):
                 self.verify_buffer.logits[:rows] = model.forward()
+                if self.verify_post is not None:
+                    self.verify_post(batch, self.verify_buffer.logits[:rows])
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     self.verify_buffer.logits[:rows] = model.forward()
+                    outs = (
+                        self.verify_post(batch, self.verify_buffer.logits[:rows])
+                        if self.verify_post is not None else None
+                    )
                 self._reset_moe_offload_cache()
             self.graph_map[("verify", bs)] = graph
-            # The MTP draft pass (eager, after replay) reads model._mtp_hidden, which
-            # model.forward() stashes -- but a replay never runs model.forward(), so keep
-            # the graph-owned hidden buffer per size and re-stash it on every replay.
+            # Graph-owned outputs (stable addresses across replays): the post-processing
+            # tensors, and model._mtp_hidden which model.forward() stashes during capture
+            # but which a replay never re-stashes.
+            self.verify_outs[bs] = outs
             self.verify_hidden[bs] = getattr(model, "_mtp_hidden", None)
         self._reset_moe_offload_cache()
 
@@ -270,6 +282,7 @@ class GraphRunner:
             self.attn_backend.prepare_for_replay(batch)
             g.replay()
             self._model._mtp_hidden = self.verify_hidden[bs]
+            batch._verify_graph_out = self.verify_outs[bs]
             return self.verify_buffer.logits[: batch.size * self.verify_tokens]
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
