@@ -181,7 +181,7 @@ Conclusions:
 
 **gpt-oss-120b bring-up (2026-08-24): works.** First-serve FTW conversion of the 61 GB MXFP4 checkpoint OK; decode 24.8 tok/s median (offload backend, triton attention, swa_radix cache). Second validated model for the container.
 
-Remaining Phase 3 candidates otherwise unchanged, plus: report the b12x int32 overflow upstream to flashinfer (draft ready).
+Remaining Phase 3 candidates otherwise unchanged. The b12x int32 overflow was reported upstream: [flashinfer#4706](https://github.com/flashinfer-ai/flashinfer/issues/4706) (checked distinct from #2776/#3383 before filing).
 
 ## 7. Sources
 
