@@ -131,9 +131,30 @@ def _load_maybe_quantized(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
     return tensor
 
 
+# Norms of the MTP head that live outside the layer-suffix scheme; Gemma-style
+# (1+weight) like every other Qwen3.5 norm (the layer norms inside mtp.layers.N
+# already match _GEMMA_NORM_SUFFIXES by suffix).
+_MTP_GEMMA_EXACT = (
+    "mtp.norm.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+)
+
+
+def _mtp_enabled() -> bool:
+    """Load the checkpoint's MTP draft head (kept in sync with models.qwen3_5_moe.mtp)."""
+    import os
+
+    return os.environ.get("FREETOKEN_MTP", "0") == "1"
+
+
 def _rename(raw_name: str) -> str | None:
     """HF key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith("mtp."):
+        # The MTP head's buffers are registered under the same ``mtp.*`` names
+        # when enabled; otherwise served text-only and dropped as before.
+        return raw_name if _mtp_enabled() else None
+    if raw_name.startswith(("model.visual.", "visual.")):
         return None
     # ModelOpt FP8 KV-cache static scales (full-attention layers only). FreeToken keeps the
     # KV cache in the engine's native precision (>= the checkpoint's quantized KV), so these
@@ -149,7 +170,40 @@ def _rename(raw_name: str) -> str | None:
 
 
 def _is_gemma_norm(name: str) -> bool:
-    return name == "model.norm.weight" or name.endswith(_GEMMA_NORM_SUFFIXES)
+    return (
+        name == "model.norm.weight"
+        or name in _MTP_GEMMA_EXACT
+        or name.endswith(_GEMMA_NORM_SUFFIXES)
+    )
+
+
+def _iter_mtp_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    fuse_buf: dict[str, dict[int, torch.Tensor]],
+    shared_buf: dict[str, dict[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Process one (already loaded, all-BF16) ``mtp.*`` tensor: q|k|v -> qkv_proj
+    fusion, shared-expert gate|up merge, Gemma +1 — the same transforms the
+    default bf16 pass applies to main-model tensors. Used by the quantized dense
+    passes, whose own fusion tables only cover the quantized main-model keys."""
+    fused = _try_fuse(name, tensor, fuse_buf)
+    if fused is not None:
+        if fused != ():  # () = buffered part, incomplete
+            yield fused
+        return
+    if name.endswith(_SHARED_GATE) or name.endswith(_SHARED_UP):
+        prefix = name.rsplit(".mlp.shared_expert.", 1)[0]
+        slots = shared_buf.setdefault(prefix, {})
+        slots["gate" if name.endswith(_SHARED_GATE) else "up"] = tensor
+        if "gate" in slots and "up" in slots:
+            merged = torch.cat([slots["gate"], slots["up"]], dim=0)
+            del shared_buf[prefix]
+            yield f"{prefix}.mlp.shared_expert.gate_up_proj.weight", merged
+        return
+    if _is_gemma_norm(name):
+        tensor = tensor + 1.0
+    yield name, tensor
 
 
 def _try_fuse(
@@ -449,6 +503,7 @@ def _iter_weights_attn_fp8(
     bf16_buf: dict[str, dict[int, torch.Tensor]] = {}
     shared_buf: dict[str, dict[str, torch.Tensor]] = {}
     nvfp4_shared_buf: dict[str, dict[str, tuple]] = {}
+    mtp_fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
 
     for file in tqdm(
         iter_weight_files(model_path),
@@ -465,6 +520,13 @@ def _iter_weights_attn_fp8(
 
                 name = _rename(raw_name)
                 if name is None:
+                    continue
+                if name.startswith("mtp."):
+                    # The MTP head is stored all-BF16 (its packed experts included),
+                    # so it bypasses this pass's fp8/nvfp4 dispatch entirely.
+                    yield from _iter_mtp_tensor(
+                        name, f.get_tensor(raw_name), mtp_fuse_buf, shared_buf
+                    )
                     continue
                 if _PACKED_EXPERT_PATTERN.match(name) is not None:
                     continue  # no packed experts in this checkpoint; guard anyway
@@ -529,6 +591,7 @@ def _iter_weights_attn_fp8(
     assert not bf16_buf, f"Incomplete bf16 fusions: {list(bf16_buf.keys())}"
     assert not shared_buf, f"Incomplete shared-expert merges: {list(shared_buf.keys())}"
     assert not nvfp4_shared_buf, f"Incomplete NVFP4 shared-expert merges: {list(nvfp4_shared_buf.keys())}"
+    assert not mtp_fuse_buf, f"Incomplete MTP projection fusions: {list(mtp_fuse_buf.keys())}"
 
 
 # ======================================================================================

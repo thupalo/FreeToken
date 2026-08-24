@@ -107,6 +107,14 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 tie_word_embeddings=config.tie_word_embeddings,
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
+        # Opt-in MTP draft head (FREETOKEN_MTP=1): registered as ``self.mtp`` so its
+        # state-dict keys are exactly the checkpoint's ``mtp.*`` names. The weight
+        # loader keeps/drops ``mtp.*`` on the same switch, so the strict
+        # load_state_dict balances in both modes.
+        from .mtp import Qwen3_5MTPHead, mtp_enabled
+
+        if config.mtp_num_layers > 0 and mtp_enabled():
+            self.mtp = Qwen3_5MTPHead(config)
         super().__init__()
 
     def forward(self) -> torch.Tensor:

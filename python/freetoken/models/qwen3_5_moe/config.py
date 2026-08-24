@@ -246,6 +246,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         shared_expert_intermediate_size=getattr(text, "shared_expert_intermediate_size", 0),
         norm_topk_prob=bool(getattr(text, "norm_topk_prob", False)),
         moe_enabled=moe_enabled,
+        mtp_num_layers=int(getattr(text, "mtp_num_hidden_layers", 0) or 0),
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen3_5_moe"),
         architectures=getattr(hf_config, "architectures", ["Qwen3_5MoeForConditionalGeneration"]),

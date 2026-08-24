@@ -245,6 +245,9 @@ class ModelConfig:
     lm_head_quant: str = "none"
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False
+    # Number of MTP (multi-token-prediction) draft layers the checkpoint ships under
+    # ``mtp.*`` (Qwen3.5/3.6: 1). 0 = none. Loading/serving the head is opt-in.
+    mtp_num_layers: int = 0
     # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----
     # The first ``first_k_dense_replace`` decoder layers use a dense MLP instead of the
     # sparse MoE block (GLM-4: 3). Experts (and the offload cache) therefore only exist
